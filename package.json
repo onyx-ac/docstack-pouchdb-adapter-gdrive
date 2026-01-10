@@ -1,0 +1,31 @@
+{
+  "name": "@docstack/pouchdb-adapter-googledrive",
+  "version": "1.0.0",
+  "description": "PouchDB adapter for Google Drive",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest"
+  },
+  "keywords": [
+    "pouchdb",
+    "adapter",
+    "google-drive"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "googleapis": "^126.0.0",
+    "pouchdb-core": "^7.3.1"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20.0.0",
+    "@types/pouchdb-core": "^7.0.15",
+    "dotenv": "^17.2.3",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.6",
+    "typescript": "^5.0.0"
+  }
+}
