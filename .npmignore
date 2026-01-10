@@ -5,3 +5,4 @@ tsconfig.json
 *.tsbuildinfo
 jest.config.json
 package-lock.json
+tests/

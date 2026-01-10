@@ -13,8 +13,16 @@
     "adapter",
     "google-drive"
   ],
-  "author": "",
-  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/onyx-ac/docstack-pouchdb-adapter-gdrive.git"
+  },
+  "author": "Onyx <hello@onyx.ac> (https://onyx.ac)",
+  "license": "CC-BY-SA-4.0",
+  "bugs": {
+    "url": "https://github.com/onyx-ac/docstack-pouchdb-adapter-gdrive/issues"
+  },
+  "homepage": "https://onyx.ac/docstack",
   "dependencies": {
     "googleapis": "^126.0.0",
     "pouchdb-core": "^7.3.1"
