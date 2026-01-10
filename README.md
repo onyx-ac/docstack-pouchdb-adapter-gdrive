@@ -12,7 +12,7 @@ npm install pouchdb-adapter-googledrive
 
 ```typescript
 import PouchDB from 'pouchdb-core';
-import GoogleDriveAdapter from 'pouchdb-adapter-googledrive';
+import GoogleDriveAdapter from '@docstack/pouchdb-adapter-googledrive';
 import { google } from 'googleapis';
 
 // Register the adapter
