@@ -2,6 +2,13 @@ import { GoogleDriveAdapterOptions, DriveData } from './types';
 import { DriveHandler } from './drive';
 
 /**
+ * Schedule a function to run asynchronously.
+ */
+function nextTick(fn: () => void): void {
+    queueMicrotask(fn);
+}
+
+/**
  * GoogleDriveAdapter - PouchDB adapter for Google Drive storage.
  * 
  * Based on the PouchDB Memory/LevelDB adapter pattern.
@@ -29,7 +36,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
             instanceId = 'gdrive-' + name + '-' + Date.now().toString(36);
 
             // Finalize initialization
-            process.nextTick(function () {
+            nextTick(function () {
                 callback(null, api);
             });
         }
@@ -60,7 +67,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 update_seq: db.currentData.seq,
                 backend_adapter: 'googledrive'
             };
-            process.nextTick(function () {
+            nextTick(function () {
                 callback(null, res);
             });
         };
@@ -165,7 +172,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 (result as any).update_seq = db.currentData.seq;
             }
 
-            process.nextTick(function () {
+            nextTick(function () {
                 callback(null, result);
             });
         };
@@ -231,7 +238,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
 
             // Persist to Google Drive
             db.save().then(() => {
-                process.nextTick(function () {
+                nextTick(function () {
                     callback(null, results);
                 });
             }).catch((err: any) => {
@@ -296,7 +303,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
             }
 
             // Initial processing
-            process.nextTick(processChanges);
+            nextTick(processChanges);
 
             return {
                 cancel: function () {
@@ -336,7 +343,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
         // Close the database
         api._close = function (callback: any) {
             db.stopPolling();
-            process.nextTick(function () {
+            nextTick(function () {
                 callback();
             });
         };
@@ -358,7 +365,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
                     callback(err);
                 });
             } else {
-                process.nextTick(function () {
+                nextTick(function () {
                     callback(null, { ok: true });
                 });
             }
