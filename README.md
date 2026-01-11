@@ -1,13 +1,15 @@
 # PouchDB Adapter for Google Drive
 
-A PouchDB adapter that uses Google Drive as a backend storage.
+A persistent, serverless PouchDB adapter that uses Google Drive as a backend storage. Designed for high concurrency, large datasets (via lazy loading), and offline resilience.
 
 ## Features
 
-- **Append-Only Log**: Uses an efficient append-only log pattern for fast writes.
-- **Auto-Compaction**: Automatically merges logs into a snapshot when thresholds are met.
-- **Offline/Sync**: Supports PouchDB's replication and sync capabilities.
-- **TypeScript**: Written in TypeScript with full type definitions.
+- **🚀 Append-Only Log**: Uses an efficient append-only log pattern for fast, conflict-free writes.
+- **⚡ Lazy Loading**: Optimizes memory and bandwidth by loading only the **Index** into memory. Document bodies are fetched on-demand.
+- **🛡️ Optimistic Concurrency Control**: Uses ETag-based locking on metadata to prevent race conditions and data loss during simultaneous updates.
+- **🔄 Replication Ready**: Fully automated support for PouchDB's `sync` and `replicate` protocols (bilateral sync).
+- **📦 Auto-Compaction**: Automatically merges logs into snapshots to keep performance high.
+- **💾 Offline/Resilient**: Retry logic with exponential backoff handles network instability and "thundering herd" scenarios.
 
 ## Installation
 
@@ -39,29 +41,38 @@ const drive = google.drive({ version: 'v3', auth: oauth2Client });
 const db = new PouchDB('my-drive-db', {
   adapter: 'googledrive',
   drive: drive,              // valid googleapis Drive instance
-  folderId: '...',           // Optional: Folder ID to store database files
+  folderId: '...',           // Optional: Storage Folder ID (recommended)
   folderName: 'my-db',       // Optional: Folder name (created if not exists)
   pollingIntervalMs: 2000,   // Optional: Check for remote changes
-  compactionThreshold: 50    // Optional: Number of changes before auto-compaction
+  compactionThreshold: 50,   // Optional: Entries before auto-compaction
+  cacheSize: 1000            // Optional: Number of document bodies to keep in LRU cache
 });
+
+// Use standard PouchDB API
+await db.put({ _id: 'doc1', title: 'Hello Drive!' });
+const doc = await db.get('doc1');
 ```
 
-## How it works
+## Architecture
 
-The adapter implements an **append-only log** pattern for efficiency and reliability:
+The adapter implements a **"Remote-First"** architecture designed for scale:
 
-1. **Folder Structure**: Each database is a folder in Google Drive.
-2. **`_meta.json`**: Tracks the current sequence number and active log files.
-3. **`snapshot.json`**: Contains the full database state at a specific sequence point.
-4. **`changes-{timestamp}.ndjson`**: New changes are appended to these newline-delimited JSON files.
+### 1. Storage Structure
+Inside your Google Drive folder, you will see:
+- `_meta.json`: The "Lock File". Tracks the sequence number and active log pointers.
+- `snapshot-index.json`: A lightweight map of `DocID -> { Revision, FilePointer }`. Loaded at startup.
+- `snapshot-data.json`: Large payload files containing document bodies. **Not loaded** until requested.
+- `changes-{seq}-{uuid}.ndjson`: Immutable append-only logs for recent updates.
 
-### Compaction
+### 2. Lazy Loading & Caching
+- **Startup**: The client downloads only `_meta.json` and `snapshot-index.json` (~MBs even for large DBs).
+- **Access**: `db.get(id)` checks a local **LRU Cache**. If missing, it fetches the specific file containing that document from Drive.
+- **Sync**: `db.changes()` iterates the local index, ensuring fast replication without downloading full content.
 
-To prevent the change logs from growing indefinitely, the adapter performs auto-compaction:
-- When the number of pending changes exceeds `compactionThreshold` (default: 100).
-- Or when the log file size exceeds `compactionSizeThreshold` (default: 1MB).
-
-Compaction merges the snapshot and all change logs into a new `snapshot.json` and deletes old log files.
+### 3. Concurrency
+- **Writes**: Every write creates a new unique `changes-*.ndjson` file.
+- **Commit**: The adapter attempts to update `_meta.json` with an ETag check (`If-Match`).
+- **Conflict**: If `_meta.json` was changed by another client, the write retries automatically after re-syncing the index.
 
 ## Testing
 
@@ -76,3 +87,7 @@ To run the tests, you need to provide Google Drive API credentials.
    ```bash
    npm test
    ```
+
+## License
+
+CC-BY-SA-4.0
