@@ -1,68 +1,69 @@
 
 import { GoogleDriveAdapter } from '../src/adapter';
+import { GoogleDriveClient } from '../src/client';
 import { DriveHandler } from '../src/drive';
+
+jest.mock('../src/client');
 
 // Mock PouchDB interface
 const PouchDB = {
     plugin: (adapter: any) => { }
 };
 
-// Reuse MockDrive from concurrency test or simple mock
-class MockDrive {
-    public files = {
-        list: jest.fn(),
-        create: jest.fn(),
-        update: jest.fn(),
-        get: jest.fn(),
-        delete: jest.fn()
-    };
-    private storage: Record<string, any> = {};
-
-    constructor() {
-        this.setupMocks();
-    }
-
-    // ... Minimal Mocks for Replication ...
-    private setupMocks() {
-        // Simple storage mock needed for adapter to work
-        this.files.list.mockResolvedValue({ data: { files: [] } }); // Start empty
-        this.files.create.mockImplementation(async (opts) => {
-            const id = 'file-' + Date.now() + Math.random();
-            const body = opts.media ? opts.media.body : '{}';
-            // Store raw string for NDJSON, or object for others? 
-            // Real Drive stores bytes. downloadFileAny(alt=media) returns string usually? 
-            // Or axios returns object if internal json parsing happens?
-            // Adapter expects string for NDJSON.
-            this.storage[id] = { id, content: body };
-            return { data: { id, etag: 'etag' } };
-        });
-        this.files.get.mockImplementation(async (opts) => {
-            if (!this.storage[opts.fileId]) throw { code: 404 };
-            return { data: this.storage[opts.fileId].content };
-        });
-        this.files.update.mockResolvedValue({ data: { id: 'file', etag: 'new' } });
-        // Need to mock list find for meta
-        this.files.list.mockImplementation(async (opts) => {
-            if (opts.q.includes('name = \'_meta.json\'')) {
-                const found = Object.values(this.storage).find((f: any) => f.content && f.content.dbName);
-                if (found) return { data: { files: [{ id: found.id, etag: 'etag' }] } };
-            }
-            return { data: { files: [] } };
-        });
-    }
-}
+const mockStorage: Record<string, any> = {};
 
 describe('Replication Compatibility', () => {
-    let mockDrive: MockDrive;
     let adapter: any;
 
     beforeEach((done) => {
-        mockDrive = new MockDrive();
+        // Clear storage
+        for (const k in mockStorage) delete mockStorage[k];
+
+        // Setup Mock Implementation
+        (GoogleDriveClient as jest.Mock).mockImplementation(() => {
+            return {
+                listFiles: jest.fn(async (q: string) => {
+                    if (q.includes('name = \'_meta.json\'')) {
+                        const found = Object.values(mockStorage).find((f: any) => f.name === '_meta.json');
+                        if (found) return [{ id: found.id, etag: 'etag' }];
+                    }
+                    return [];
+                }),
+                getFile: jest.fn(async (fileId: string) => {
+                    const file = mockStorage[fileId];
+                    if (!file) throw { status: 404 };
+                    return file.content;
+                }),
+                createFile: jest.fn(async (name: string, parents: string[] | undefined, mimeType: string, content: string) => {
+                    const id = 'file-' + Date.now() + Math.random();
+                    let parsedContent: any;
+                    try {
+                        parsedContent = content ? JSON.parse(content) : {};
+                    } catch {
+                        parsedContent = content;
+                    }
+                    mockStorage[id] = { id, name, content: parsedContent, mimeType };
+                    return { id, etag: 'etag' };
+                }),
+                updateFile: jest.fn(async (fileId: string, content: string, expectedEtag?: string) => {
+                    try {
+                        mockStorage[fileId].content = content ? JSON.parse(content) : {};
+                    } catch {
+                        mockStorage[fileId].content = content;
+                    }
+                    return { id: fileId, etag: 'new-etag' };
+                }),
+                deleteFile: jest.fn(async (fileId: string) => {
+                    delete mockStorage[fileId];
+                })
+            };
+        });
+
         const DriveAdapter = GoogleDriveAdapter(PouchDB);
 
         // Initialize Adapter
         const opts = {
-            drive: mockDrive as any,
+            accessToken: 'mock-token',
             name: 'test-repl',
             folderName: 'test-repl'
         };
@@ -119,12 +120,7 @@ describe('Replication Compatibility', () => {
                     since: seq1,
                     include_docs: true,
                     complete: (err: any, res: any) => {
-                        expect(res.results.length).toBe(1); // Should only be doc2?
-                        // Wait, since lazy index loads everything, does _changes filter by seq?
-                        // My implementation in adapter.ts lines 369+ tries to filter:
-                        // if (entry.seq <= since) continue;
-
-                        // Verification:
+                        expect(res.results.length).toBe(1);
                         expect(res.results[0].id).toBe('doc2');
                         done();
                     }
