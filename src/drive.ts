@@ -9,6 +9,7 @@ import {
     LegacySnapshotData
 } from './types';
 import { LRUCache } from './cache';
+import { GoogleDriveClient } from './client';
 
 const DEFAULT_COMPACTION_THRESHOLD = 100; // entries
 const DEFAULT_SIZE_THRESHOLD = 1024 * 1024; // 1MB
@@ -25,7 +26,7 @@ const DEFAULT_CACHE_SIZE = 1000; // Number of docs
  *   └── changes-*.ndjson     # Append logs
  */
 export class DriveHandler {
-    private drive: any;
+    private client: GoogleDriveClient;
     private folderId: string | null = null;
     private folderName: string;
     private parents: string[];
@@ -56,7 +57,7 @@ export class DriveHandler {
     private pollingInterval: NodeJS.Timeout | null = null;
 
     constructor(options: GoogleDriveAdapterOptions, dbName: string) {
-        this.drive = options.drive;
+        this.client = new GoogleDriveClient(options);
         this.folderId = options.folderId || null;
         this.folderName = options.folderName || dbName;
         this.parents = options.parents || [];
@@ -308,7 +309,7 @@ export class DriveHandler {
             try {
                 return await this.tryAppendChanges(changes);
             } catch (err: any) {
-                if (err.code === 412 || err.code === 409) {
+                if (err.status === 412 || err.status === 409) {
                     // Reload and RETRY
                     await this.load();
                     // Check conflicts against Index (Metadata sufficient)
@@ -413,16 +414,13 @@ export class DriveHandler {
 
         // 2. Upload Data File
         const dataContent = JSON.stringify(snapshotData);
-        const dataRes = await this.drive.files.create({
-            requestBody: {
-                name: `snapshot-data-${Date.now()}.json`,
-                parents: [this.folderId],
-                mimeType: 'application/json'
-            },
-            media: { mimeType: 'application/json', body: dataContent },
-            fields: 'id'
-        });
-        const dataFileId = dataRes.data.id;
+        const dataRes = await this.client.createFile(
+            `snapshot-data-${Date.now()}.json`,
+            [this.folderId!],
+            'application/json',
+            dataContent
+        );
+        const dataFileId = dataRes.id;
 
         // 3. Create Index pointing to this Data File
         const newIndexEntries: Record<string, IndexEntry> = {};
@@ -441,16 +439,13 @@ export class DriveHandler {
         };
 
         const indexContent = JSON.stringify(snapshotIndex);
-        const indexRes = await this.drive.files.create({
-            requestBody: {
-                name: `snapshot-index-${Date.now()}.json`,
-                parents: [this.folderId],
-                mimeType: 'application/json'
-            },
-            media: { mimeType: 'application/json', body: indexContent },
-            fields: 'id'
-        });
-        const newIndexId = indexRes.data.id;
+        const indexRes = await this.client.createFile(
+            `snapshot-index-${Date.now()}.json`,
+            [this.folderId!],
+            'application/json',
+            indexContent
+        );
+        const newIndexId = indexRes.id;
 
         // 4. Update Meta
         await this.atomicUpdateMeta((latest) => {
@@ -483,7 +478,7 @@ export class DriveHandler {
                 this.meta = newMeta;
                 return;
             } catch (err: any) {
-                if (err.code === 412 || err.code === 409) {
+                if (err.status === 412 || err.status === 409) {
                     attempt++;
                     await new Promise(r => setTimeout(r, Math.random() * 500 + 100));
                     continue;
@@ -496,45 +491,41 @@ export class DriveHandler {
     // Reused helpers
     private async findOrCreateFolder(): Promise<string> {
         const q = `name = '${this.folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
-        const res = await this.drive.files.list({ q, spaces: 'drive', fields: 'files(id)' });
-        if (res.data.files && res.data.files.length > 0) return res.data.files[0].id;
-        const createRes = await this.drive.files.create({
-            requestBody: { name: this.folderName, mimeType: 'application/vnd.google-apps.folder', parents: this.parents.length ? this.parents : undefined },
-            fields: 'id'
-        });
-        return createRes.data.id;
+        const files = await this.client.listFiles(q);
+        if (files.length > 0) return files[0].id;
+
+        const createRes = await this.client.createFile(
+            this.folderName,
+            this.parents.length ? this.parents : undefined,
+            'application/vnd.google-apps.folder',
+            ''
+        );
+        return createRes.id;
     }
 
     private async findFile(name: string): Promise<{ id: string, etag: string } | null> {
         const q = `name = '${name}' and '${this.folderId}' in parents and trashed = false`;
-        const res = await this.drive.files.list({ q, spaces: 'drive', fields: 'files(id, etag)' });
-        if (res.data.files && res.data.files.length > 0) return { id: res.data.files[0].id, etag: res.data.files[0].etag };
+        const files = await this.client.listFiles(q);
+        if (files.length > 0) return { id: files[0].id, etag: files[0].etag || '' };
         return null;
     }
 
     private async downloadJson(fileId: string): Promise<any> {
-        const res = await this.drive.files.get({ fileId, alt: 'media' });
-        return res.data;
+        return await this.client.getFile(fileId);
     }
 
     private async downloadFileAny(fileId: string): Promise<any> {
-        const res = await this.drive.files.get({ fileId, alt: 'media' });
-        if (typeof res.data === 'string') {
-            // NDJSON or JSON string
-            try {
-                return JSON.parse(res.data);
-            } catch {
-                // NDJSON?
-                const lines = res.data.trim().split('\n').filter((l: string) => l);
-                return lines.map((line: string) => JSON.parse(line));
-            }
-        }
-        return res.data;
+        return await this.client.getFile(fileId);
     }
 
     private async downloadNdjson(fileId: string): Promise<ChangeEntry[]> {
-        const res = await this.drive.files.get({ fileId, alt: 'media' });
-        const content = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+        const data = await this.client.getFile(fileId);
+        // data will likely be a string if NDJSON is returned and getFile sees weird content-type
+        // Or if getFile auto-parsed standard "application/json" but NDJSON is just text.
+        // Google Drive might return application/json for everything if we aren't careful?
+        // Actually .ndjson is separate.
+        // Safest: Handle string or object.
+        const content = typeof data === 'string' ? data : JSON.stringify(data);
         const lines = content.trim().split('\n').filter((l: string) => l);
         return lines.map((line: string) => JSON.parse(line));
     }
@@ -543,33 +534,28 @@ export class DriveHandler {
         const lines = changes.map(c => JSON.stringify(c)).join('\n') + '\n';
         const startSeq = changes[0].seq;
         const name = `changes-${startSeq}-${Math.random().toString(36).substring(7)}.ndjson`;
-        const res = await this.drive.files.create({
-            requestBody: { name, parents: [this.folderId], mimeType: 'application/x-ndjson' },
-            media: { mimeType: 'application/x-ndjson', body: lines },
-            fields: 'id'
-        });
+
+        const res = await this.client.createFile(
+            name,
+            [this.folderId!],
+            'application/x-ndjson',
+            lines
+        );
+
         this.currentLogSizeEstimate += new Blob([lines]).size;
-        return res.data.id;
+        return res.id;
     }
 
     private async saveMeta(meta: MetaData, expectedEtag: string | null = null): Promise<void> {
         const content = JSON.stringify(meta);
         const metaFile = await this.findFile('_meta.json');
+
         if (metaFile) {
-            const res = await this.drive.files.update({
-                fileId: metaFile.id,
-                headers: expectedEtag ? { 'If-Match': expectedEtag } : undefined,
-                media: { mimeType: 'application/json', body: content },
-                fields: 'id, etag'
-            });
-            this.metaEtag = res.data.etag;
+            const res = await this.client.updateFile(metaFile.id, content, expectedEtag || undefined);
+            this.metaEtag = res.etag;
         } else {
-            const res = await this.drive.files.create({
-                requestBody: { name: '_meta.json', parents: [this.folderId], mimeType: 'application/json' },
-                media: { mimeType: 'application/json', body: content },
-                fields: 'id, etag'
-            });
-            this.metaEtag = res.data.etag;
+            const res = await this.client.createFile('_meta.json', [this.folderId!], 'application/json', content);
+            this.metaEtag = res.etag;
         }
     }
 
@@ -583,8 +569,8 @@ export class DriveHandler {
     }
 
     private async cleanupOldFiles(oldIndexId: string | null, oldLogIds: string[]) {
-        if (oldIndexId) try { await this.drive.files.delete({ fileId: oldIndexId }); } catch { }
-        for (const id of oldLogIds) try { await this.drive.files.delete({ fileId: id }); } catch { }
+        if (oldIndexId) try { await this.client.deleteFile(oldIndexId); } catch { }
+        for (const id of oldLogIds) try { await this.client.deleteFile(id); } catch { }
     }
 
     private startPolling(intervalMs: number): void {
@@ -593,6 +579,7 @@ export class DriveHandler {
             try {
                 const metaFile = await this.findFile('_meta.json');
                 if (!metaFile) return;
+                // Etag check
                 if (metaFile.etag !== this.metaEtag) {
                     await this.load();
                     this.notifyListeners();
@@ -618,6 +605,6 @@ export class DriveHandler {
     // For tests/debug
     onChange(cb: any) { this.listeners.push(cb); }
     stopPolling() { if (this.pollingInterval) clearInterval(this.pollingInterval); }
-    async deleteFolder() { if (this.folderId) await this.drive.files.delete({ fileId: this.folderId }); }
+    async deleteFolder() { if (this.folderId) await this.client.deleteFile(this.folderId); }
     getNextSeq() { return this.meta.seq + 1; }
 }

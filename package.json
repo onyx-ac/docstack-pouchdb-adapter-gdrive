@@ -1,6 +1,6 @@
 {
   "name": "@docstack/pouchdb-adapter-googledrive",
-  "version": "0.0.1",
+  "version": "0.0.4",
   "description": "PouchDB adapter for Google Drive",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -23,8 +23,10 @@
     "url": "https://github.com/onyx-ac/docstack-pouchdb-adapter-gdrive/issues"
   },
   "homepage": "https://onyx.ac/docstack",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "googleapis": "^126.0.0",
     "pouchdb-core": "^7.3.1"
   },
   "devDependencies": {

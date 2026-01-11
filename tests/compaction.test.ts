@@ -1,44 +1,38 @@
 
 import PouchDB from 'pouchdb-core';
 import * as dotenv from 'dotenv';
-import { google } from 'googleapis';
 import GoogleDriveAdapter from '../src/index';
+import { GoogleDriveClient } from '../src/client';
 
 dotenv.config();
 
-// Register the adapter
-GoogleDriveAdapter(PouchDB);
+// Register the adapter factory
+PouchDB.plugin(GoogleDriveAdapter({ accessToken: 'placeholder' } as any));
 
 describe('Compaction & Append-Log', () => {
-    let drive: any;
+    let client: GoogleDriveClient;
+    let accessToken: string;
     let dbName: string;
 
     beforeAll(() => {
-        const clientId = process.env.GOOGLE_CLIENT_ID;
-        const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-        const redirectUrl = process.env.GOOGLE_REDIRECT_URL;
-        const accessToken = process.env.GOOGLE_ACCESS_TOKEN;
-        const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+        accessToken = process.env.GOOGLE_ACCESS_TOKEN || '';
 
-        if (!clientId || !clientSecret || !accessToken) {
+        if (!accessToken) {
             console.warn('Skipping tests requiring Google Drive credentials');
             return;
         }
 
-        const oauth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUrl);
-        oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
-
-        drive = google.drive({ version: 'v3', auth: oauth2Client });
+        client = new GoogleDriveClient({ accessToken });
         dbName = 'test-compaction-' + Date.now();
     });
 
     it('should auto-compact after threshold is reached', async () => {
-        if (!drive) return;
+        if (!client) return;
 
         // Set low threshold for testing
         const db = new PouchDB(dbName, {
             adapter: 'googledrive',
-            drive: drive,
+            accessToken: accessToken,
             compactionThreshold: 3, // Very low threshold
             folderName: dbName     // Separate folder
         } as any);
@@ -63,15 +57,13 @@ describe('Compaction & Append-Log', () => {
         expect(allDocs.rows.find((r: any) => r.id === 'doc1')).toBeTruthy();
 
         // 4. Verify internal storage structure (snapshot exists, logs cleared)
-        const q = `name = '${dbName}' and mimeType = 'application/vnd.google-apps.folder'`;
-        const folderRes = await drive.files.list({ q });
-        const folderId = folderRes.data.files[0].id;
+        const q = `name = '${dbName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+        const folders = await client.listFiles(q);
+        const folderId = folders[0].id;
 
-        const filesRes = await drive.files.list({
-            q: `'${folderId}' in parents and trashed = false`
-        });
+        const files = await client.listFiles(`'${folderId}' in parents and trashed = false`);
+        const fileNames = files.map((f: any) => f.name);
 
-        const fileNames = filesRes.data.files.map((f: any) => f.name);
         // Expect new format
         const indexFile = fileNames.find((n: string) => n.startsWith('snapshot-index-'));
         const dataFile = fileNames.find((n: string) => n.startsWith('snapshot-data-'));
@@ -85,12 +77,12 @@ describe('Compaction & Append-Log', () => {
     }, 60000); // 60s timeout
 
     afterAll(async () => {
-        if (!drive) return;
+        if (!client) return;
         // Cleanup folder
-        const q = `name = '${dbName}' and mimeType = 'application/vnd.google-apps.folder'`;
-        const res = await drive.files.list({ q });
-        if (res.data.files.length > 0) {
-            await drive.files.delete({ fileId: res.data.files[0].id });
+        const q = `name = '${dbName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+        const res = await client.listFiles(q);
+        if (res.length > 0) {
+            await client.deleteFile(res[0].id);
         }
     });
 });

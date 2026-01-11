@@ -1,10 +1,10 @@
-/** Google Drive API client type */
-export type DriveClient = any; // googleapis drive_v3.Drive
+import { DriveClientOptions } from './client';
+
+/** Global fetch type for environments that might need it (Node < 18 polyfills) */
+declare const fetch: any;
 
 /** Options for configuring the Google Drive adapter */
-export interface GoogleDriveAdapterOptions {
-    /** Configured Google Drive client (googleapis) */
-    drive: DriveClient;
+export interface GoogleDriveAdapterOptions extends DriveClientOptions {
     /** Specific folder ID to use as the DB root */
     folderId?: string;
     /** Folder name to search/create if no ID provided */
