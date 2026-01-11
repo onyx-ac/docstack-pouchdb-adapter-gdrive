@@ -5,6 +5,7 @@ export interface DriveFile {
     mimeType: string;
     parents?: string[];
     etag?: string;
+    modifiedTime?: string;
 }
 
 export interface DriveClientOptions {
@@ -25,26 +26,46 @@ export class GoogleDriveClient {
     }
 
     private async fetch(url: string, init: RequestInit): Promise<Response> {
+        const method = init.method || 'GET';
         const token = await this.getToken();
         const headers = new Headers(init.headers);
         headers.set('Authorization', `Bearer ${token}`);
 
-        const res = await fetch(url, { ...init, headers });
-        const method = init.method || 'GET';
+        let res: Response;
+        try {
+            res = await fetch(url, { ...init, headers });
+        } catch (networkErr: any) {
+            const err: any = new Error(`Network Error: ${networkErr.message} (${method} ${url})`);
+            err.code = 'network_error';
+            err.url = url;
+            err.method = method;
+            throw err;
+        }
 
         if (!res.ok) {
-            // Basic error handling
             const text = await res.text();
             let errorMsg = `Drive API Error: ${res.status} ${res.statusText} (${method} ${url})`;
+            let reason = res.statusText;
+
             try {
                 const json = JSON.parse(text);
-                if (json.error && json.error.message) {
-                    errorMsg += ` - ${json.error.message}`;
+                const gError = json.error;
+                if (gError) {
+                    errorMsg += ` - ${gError.message || 'Unknown Error'}`;
+                    if (Array.isArray(gError.errors) && gError.errors.length > 0) {
+                        reason = gError.errors[0].reason || reason;
+                        if (gError.errors[0].message && gError.errors[0].message !== gError.message) {
+                            errorMsg += ` (${gError.errors[0].message})`;
+                        }
+                    }
                 }
             } catch { }
 
             const err: any = new Error(errorMsg);
             err.status = res.status;
+            err.code = reason;
+            err.url = url;
+            err.method = method;
             throw err;
         }
         return res;
@@ -53,12 +74,12 @@ export class GoogleDriveClient {
     async listFiles(q: string): Promise<DriveFile[]> {
         const params = new URLSearchParams({
             q,
-            fields: 'files(id, name, mimeType, parents, etag)',
-            spaces: 'drive',
-            pageSize: '1000' // Ensure we get enough
+            fields: 'files(id,name,mimeType,parents,modifiedTime)'
         });
+        // FIX: URLSearchParams uses '+', but Drive API is safer with '%20'
+        const queryString = params.toString().replace(/\+/g, '%20');
 
-        const res = await this.fetch(`${BASE_URL}?${params.toString()}`, { method: 'GET' });
+        const res = await this.fetch(`${BASE_URL}?${queryString}`, { method: 'GET' });
         const data = await res.json();
         return data.files || [];
     }
@@ -67,7 +88,8 @@ export class GoogleDriveClient {
         // Try getting media
         try {
             const params = new URLSearchParams({ alt: 'media' });
-            const res = await this.fetch(`${BASE_URL}/${fileId}?${params.toString()}`, { method: 'GET' });
+            const queryString = params.toString().replace(/\+/g, '%20');
+            const res = await this.fetch(`${BASE_URL}/${fileId}?${queryString}`, { method: 'GET' });
             // Standard fetch handles JSON/Text transparency? 
             // We expect JSON mostly, but sometimes we might want text.
             // PouchDB adapter flow: downloadJson, downloadNdjson
@@ -86,12 +108,13 @@ export class GoogleDriveClient {
 
     // Single metadata get (for etag check)
     async getFileMetadata(fileId: string): Promise<DriveFile> {
-        const params = new URLSearchParams({ fields: 'id, name, mimeType, parents, etag' });
-        const res = await this.fetch(`${BASE_URL}/${fileId}?${params.toString()}`, { method: 'GET' });
+        const params = new URLSearchParams({ fields: 'id,name,mimeType,parents,modifiedTime' });
+        const queryString = params.toString().replace(/\+/g, '%20');
+        const res = await this.fetch(`${BASE_URL}/${fileId}?${queryString}`, { method: 'GET' });
         return await res.json();
     }
 
-    async createFile(name: string, parents: string[] | undefined, mimeType: string, content: string): Promise<{ id: string, etag: string }> {
+    async createFile(name: string, parents: string[] | undefined, mimeType: string, content: string): Promise<{ id: string, etag: string, modifiedTime: string }> {
         const metadata = {
             name,
             mimeType,
@@ -100,35 +123,50 @@ export class GoogleDriveClient {
 
         // Folders or empty content can use simple metadata-only POST
         if (!content && mimeType === 'application/vnd.google-apps.folder') {
-            const res = await this.fetch(`${BASE_URL}?fields=id,etag`, {
+            const res = await this.fetch(`${BASE_URL}?fields=id,modifiedTime`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(metadata)
             });
-            return await res.json();
+            const data = await res.json();
+            return {
+                id: data.id,
+                etag: data.etag || '',
+                modifiedTime: data.modifiedTime || ''
+            };
         }
 
         const multipartBody = this.buildMultipart(metadata, content, mimeType);
 
-        const res = await this.fetch(`${UPLOAD_URL}?uploadType=multipart&fields=id,etag`, {
+        const res = await this.fetch(`${UPLOAD_URL}?uploadType=multipart&fields=id,modifiedTime`, {
             method: 'POST',
             headers: {
                 'Content-Type': `multipart/related; boundary=${multipartBody.boundary}`
             },
             body: multipartBody.body
         });
-        return await res.json();
+        const data = await res.json();
+        return {
+            id: data.id,
+            etag: data.etag || '',
+            modifiedTime: data.modifiedTime || ''
+        };
     }
 
-    async updateFile(fileId: string, content: string, expectedEtag?: string): Promise<{ id: string, etag: string }> {
+    async updateFile(fileId: string, content: string, expectedEtag?: string): Promise<{ id: string, etag: string, modifiedTime: string }> {
         // Update content (media) usually, but sometimes meta?
         // In our usage (saveMeta), we update body.
-        const res = await this.fetch(`${UPLOAD_URL}/${fileId}?uploadType=media&fields=id,etag`, {
+        const res = await this.fetch(`${UPLOAD_URL}/${fileId}?uploadType=media&fields=id,modifiedTime`, {
             method: 'PATCH',
             headers: expectedEtag ? { 'If-Match': expectedEtag, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' },
             body: content
         });
-        return await res.json();
+        const data = await res.json();
+        return {
+            id: data.id,
+            etag: data.etag || '',
+            modifiedTime: data.modifiedTime || ''
+        };
     }
 
     async deleteFile(fileId: string): Promise<void> {

@@ -44,6 +44,7 @@ export class DriveHandler {
     };
 
     private metaEtag: string | null = null;
+    private metaModifiedTime: string | null = null;
 
     // In-Memory Index: ID -> Metadata/Pointer
     private index: Record<string, IndexEntry> = {};
@@ -87,6 +88,7 @@ export class DriveHandler {
         if (metaFile) {
             this.meta = await this.downloadJson(metaFile.id);
             this.metaEtag = metaFile.etag || null;
+            this.metaModifiedTime = metaFile.modifiedTime || null;
         } else {
             await this.saveMeta(this.meta);
         }
@@ -509,12 +511,16 @@ export class DriveHandler {
         return createRes.id;
     }
 
-    private async findFile(name: string): Promise<{ id: string, etag: string } | null> {
+    private async findFile(name: string): Promise<{ id: string, etag: string, modifiedTime: string } | null> {
         if (!this.folderId) return null;
         const safeName = this.escapeQuery(name);
         const q = `name = '${safeName}' and '${this.folderId}' in parents and trashed = false`;
         const files = await this.client.listFiles(q);
-        if (files.length > 0) return { id: files[0].id, etag: files[0].etag || '' };
+        if (files.length > 0) return {
+            id: files[0].id,
+            etag: files[0].etag || '',
+            modifiedTime: files[0].modifiedTime || ''
+        };
         return null;
     }
 
@@ -561,9 +567,11 @@ export class DriveHandler {
         if (metaFile) {
             const res = await this.client.updateFile(metaFile.id, content, expectedEtag || undefined);
             this.metaEtag = res.etag;
+            this.metaModifiedTime = res.modifiedTime;
         } else {
             const res = await this.client.createFile('_meta.json', [this.folderId!], 'application/json', content);
             this.metaEtag = res.etag;
+            this.metaModifiedTime = res.modifiedTime;
         }
     }
 
@@ -587,8 +595,8 @@ export class DriveHandler {
             try {
                 const metaFile = await this.findFile('_meta.json');
                 if (!metaFile) return;
-                // Etag check
-                if (metaFile.etag !== this.metaEtag) {
+                // Use modifiedTime for polling as it's readable in projections
+                if (metaFile.modifiedTime !== this.metaModifiedTime) {
                     await this.load();
                     this.notifyListeners();
                 }
