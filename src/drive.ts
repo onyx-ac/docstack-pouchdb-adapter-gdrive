@@ -27,6 +27,7 @@ const DEFAULT_CACHE_SIZE = 1000; // Number of docs
  */
 export class DriveHandler {
     private client: GoogleDriveClient;
+    private options: GoogleDriveAdapterOptions;
     private folderId: string | null = null;
     private folderName: string;
     private parents: string[];
@@ -58,6 +59,7 @@ export class DriveHandler {
 
     constructor(options: GoogleDriveAdapterOptions, dbName: string) {
         this.client = new GoogleDriveClient(options);
+        this.options = options;
         this.folderId = options.folderId || null;
         this.folderName = options.folderName || dbName;
         this.parents = options.parents || [];
@@ -67,9 +69,7 @@ export class DriveHandler {
 
         this.docCache = new LRUCache(options.cacheSize || DEFAULT_CACHE_SIZE);
 
-        if (options.pollingIntervalMs) {
-            this.startPolling(options.pollingIntervalMs);
-        }
+        // Polling will be started in load() after folderId is resolved
     }
 
     // Public getter for Sequence (used by adapter)
@@ -137,6 +137,11 @@ export class DriveHandler {
                     this.docCache.remove(change.id);
                 }
             }
+        }
+
+        // 3. Start Polling (if enabled)
+        if (this.options.pollingIntervalMs) {
+            this.startPolling(this.options.pollingIntervalMs);
         }
     }
 
@@ -490,7 +495,8 @@ export class DriveHandler {
 
     // Reused helpers
     private async findOrCreateFolder(): Promise<string> {
-        const q = `name = '${this.folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+        const safeName = this.escapeQuery(this.folderName);
+        const q = `name = '${safeName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
         const files = await this.client.listFiles(q);
         if (files.length > 0) return files[0].id;
 
@@ -504,7 +510,9 @@ export class DriveHandler {
     }
 
     private async findFile(name: string): Promise<{ id: string, etag: string } | null> {
-        const q = `name = '${name}' and '${this.folderId}' in parents and trashed = false`;
+        if (!this.folderId) return null;
+        const safeName = this.escapeQuery(name);
+        const q = `name = '${safeName}' and '${this.folderId}' in parents and trashed = false`;
         const files = await this.client.listFiles(q);
         if (files.length > 0) return { id: files[0].id, etag: files[0].etag || '' };
         return null;
@@ -605,6 +613,11 @@ export class DriveHandler {
     // For tests/debug
     onChange(cb: any) { this.listeners.push(cb); }
     stopPolling() { if (this.pollingInterval) clearInterval(this.pollingInterval); }
+
+    private escapeQuery(value: string): string {
+        return value.replace(/'/g, "\\'");
+    }
+
     async deleteFolder() { if (this.folderId) await this.client.deleteFile(this.folderId); }
     getNextSeq() { return this.meta.seq + 1; }
 }

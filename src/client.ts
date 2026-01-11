@@ -30,11 +30,12 @@ export class GoogleDriveClient {
         headers.set('Authorization', `Bearer ${token}`);
 
         const res = await fetch(url, { ...init, headers });
+        const method = init.method || 'GET';
 
         if (!res.ok) {
             // Basic error handling
             const text = await res.text();
-            let errorMsg = `Drive API Error: ${res.status} ${res.statusText}`;
+            let errorMsg = `Drive API Error: ${res.status} ${res.statusText} (${method} ${url})`;
             try {
                 const json = JSON.parse(text);
                 if (json.error && json.error.message) {
@@ -96,6 +97,16 @@ export class GoogleDriveClient {
             mimeType,
             parents
         };
+
+        // Folders or empty content can use simple metadata-only POST
+        if (!content && mimeType === 'application/vnd.google-apps.folder') {
+            const res = await this.fetch(`${BASE_URL}?fields=id,etag`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(metadata)
+            });
+            return await res.json();
+        }
 
         const multipartBody = this.buildMultipart(metadata, content, mimeType);
 

@@ -8,6 +8,11 @@ A persistent, serverless PouchDB adapter that uses Google Drive as a backend sto
 - **⚡ Lazy Loading**: Optimizes memory and bandwidth by loading only the **Index** into memory. Document bodies are fetched on-demand.
 - **🛡️ Optimistic Concurrency Control**: Uses ETag-based locking on metadata to prevent race conditions.
 - **📦 Auto-Compaction**: Automatically merges logs for performance.
+- **🌍 Universal**: Works natively in Node.js 18+, Browsers, and Edge environments (no `googleapis` dependency).
+
+## Requirements
+
+- **Node.js 18+** (for global `fetch` support) or a modern browser.
 
 ## Installation
 
@@ -17,37 +22,42 @@ npm install @docstack/pouchdb-adapter-googledrive
 
 ## Usage
 
-The adapter is initialized as a plugin with your Google Drive configuration.
+The adapter is initialized as a plugin with your Google Drive access token.
 
 ```typescript
 import PouchDB from 'pouchdb-core';
 import GoogleDriveAdapter from '@docstack/pouchdb-adapter-googledrive';
-import { google } from 'googleapis';
 
-// 1. Setup Google Drive Client
-const oauth2Client = new google.auth.OAuth2(CLIENT_ID, SECRET, REDIRECT);
-oauth2Client.setCredentials({ access_token: '...' });
-const drive = google.drive({ version: 'v3', auth: oauth2Client });
-
-// 2. Initialize the Adapter Plugin with Config
+// 1. Initialize the Adapter Plugin Factory
 const adapterPlugin = GoogleDriveAdapter({
-  drive: drive,
-  folderName: 'my-app-db-folder', // Root folder
-  pollingIntervalMs: 2000
+  accessToken: 'YOUR_GOOGLE_ACCESS_TOKEN',
+  folderName: 'my-app-db-folder', // Root folder in Drive
+  pollingIntervalMs: 2000         // Optional: check for remote changes
 });
 
-// 3. Register Plugin
+// 2. Register Plugin
 PouchDB.plugin(adapterPlugin);
-// Also needs replication plugin if using replicate()
-// PouchDB.plugin(require('pouchdb-replication'));
 
-// 4. Create Database
-// No need to pass 'drive' here anymore!
+// 3. Create Database
 const db = new PouchDB('user_db', {
   adapter: 'googledrive'
 });
 
 await db.post({ title: 'Hello World' });
+```
+
+### Dynamic Tokens
+
+If your token expires, you can provide an async function that returns a valid token:
+
+```typescript
+const adapterPlugin = GoogleDriveAdapter({
+  accessToken: async () => {
+    const session = await getMySession();
+    return session.accessToken;
+  },
+  folderName: 'my-app-db'
+});
 ```
 
 ## Architecture
