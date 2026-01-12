@@ -36,20 +36,33 @@ export function GoogleDriveAdapter(PouchDB: any) {
         // Initialize DriveHandler
         db = new DriveHandler(adapterOpts, name);
 
+        // Wrap callback to ensure it's only called once
+        let callbackCalled = false;
+        const onceCallback: AdapterCallback = (err, api) => {
+            if (callbackCalled) return;
+            callbackCalled = true;
+            callback(err, api);
+        };
+
+        const debug = adapterOpts.debug;
+        const log = (...args: any[]) => { if (debug) console.log(`[googledrive-adapter] [${name}]`, ...args); };
+
+        // Load data from Drive and initialize
+        db.load().then(() => {
+            log('Database loaded');
+            afterDBCreated();
+        }).catch((err: Error) => {
+            log('Load error', err);
+            onceCallback(err);
+        });
+
         // After database is initialized
         function afterDBCreated() {
             instanceId = 'gdrive-' + name + '-' + Date.now().toString(36);
             nextTick(function () {
-                callback(null, api);
+                onceCallback(null, api);
             });
         }
-
-        // Load data from Drive and initialize
-        db.load().then(() => {
-            afterDBCreated();
-        }).catch((err: Error) => {
-            callback(err);
-        });
 
         // ============ PouchDB Adapter API Methods ============
 
@@ -92,28 +105,22 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 opts = {};
             }
 
+            // PouchDB sometimes asks for metadata only (revs, revs_info) 
+            log('_get', id);
             db.get(id).then(doc => {
                 if (!doc) {
                     return callback({
                         status: 404,
                         error: true,
                         name: 'not_found',
-                        message: 'missing',
-                        reason: 'missing'
+                        message: 'missing'
                     });
                 }
 
-                const metadata = {
-                    id: doc._id,
-                    rev: doc._rev,
-                    winningRev: doc._rev,
-                    deleted: !!doc._deleted
-                };
-
-                callback(null, { doc, metadata });
-            }).catch(err => {
-                callback(err);
-            });
+                // If only rev was requested? (Internal optimization)
+                // PouchDB core handles this if we return the full doc.
+                callback(null, { doc, metadata: { id: doc._id, rev: doc._rev, winningRev: doc._rev } });
+            }).catch(callback);
         };
 
         // Get all documents (Lazy stream or fetch)
@@ -194,6 +201,43 @@ export function GoogleDriveAdapter(PouchDB: any) {
             }
         };
 
+        // Bulk Get optimization for Replication
+        api._bulkGet = function (req: any, opts: any, callback: any): void {
+            const docs = req.docs;
+            const ids = docs.map((d: any) => d.id);
+
+            db.getMulti(ids).then(results => {
+                const response = {
+                    results: ids.map((id: string, i: number) => {
+                        const doc = results[i];
+                        const requestedRev = docs[i].rev;
+                        const entry = db.getIndexEntry(id);
+
+                        let docResult: any;
+                        if (!doc || (requestedRev && doc._rev !== requestedRev)) {
+                            docResult = {
+                                error: {
+                                    status: 404,
+                                    error: true,
+                                    name: 'not_found',
+                                    message: 'missing'
+                                }
+                            };
+                        } else {
+                            docResult = { ok: doc };
+                        }
+
+                        return {
+                            id,
+                            docs: [docResult]
+                        };
+                    })
+                };
+                callback(null, response);
+            }).catch(callback);
+        };
+
+
         // Bulk document operations
         api._bulkDocs = function (req: any, opts: any, callback: any): void {
             const docs = req.docs;
@@ -263,10 +307,12 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 }
             }
 
+            log('_bulkDocs flushing', changes.length, 'changes');
             // Append changes to log
             db.appendChanges(changes).then(() => {
                 nextTick(() => callback(null, results));
             }).catch((err: Error) => {
+                log('_bulkDocs error', err);
                 callback(err);
             });
         };
@@ -326,6 +372,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
 
             // Simplified Async Version
             async function processChangesAsync() {
+                log('_changes processing since', since, 'limit', limit);
                 const keys = db.getIndexKeys();
                 let processed = 0;
 
@@ -351,28 +398,54 @@ export function GoogleDriveAdapter(PouchDB: any) {
                     lastSeq = Math.max(lastSeq, entry.seq);
                 }
 
-                if (opts.complete && !complete) {
+                if (opts.complete && !complete && !opts.live) {
                     opts.complete(null, { results, last_seq: lastSeq });
                 }
             }
 
+            let cancelLive: (() => void) | undefined;
+            let liveListener: (changedDocs: Record<string, any>) => void;
             if (opts.live) {
-                db.onChange((changes: Record<string, any>) => {
-                    // Update feed
-                    // ...
-                });
+                log('_changes setting up live listener');
+                liveListener = (changedDocs: Record<string, any>) => {
+                    if (complete) return;
+                    for (const id of Object.keys(changedDocs)) {
+                        const entry = db.getIndexEntry(id);
+                        if (entry && entry.seq > lastSeq) {
+                            const change: any = {
+                                id: id,
+                                seq: entry.seq,
+                                changes: [{ rev: entry.rev }]
+                            };
+
+                            if (opts.include_docs) {
+                                db.get(id).then(doc => {
+                                    change.doc = doc;
+                                    if (opts.onChange) opts.onChange(change);
+                                    lastSeq = Math.max(lastSeq, change.seq);
+                                }).catch(e => log('Live change body fetch error', e));
+                            } else {
+                                if (opts.onChange) opts.onChange(change);
+                                lastSeq = Math.max(lastSeq, change.seq);
+                            }
+                        }
+                    }
+                };
+                cancelLive = db.onChange(liveListener);
             }
 
             nextTick(() => {
                 processChangesAsync().catch(err => {
-                    console.error('Changes feed error', err);
+                    log('_changes error', err);
                     if (opts.complete) opts.complete(err);
                 });
             });
 
             return {
                 cancel(): void {
+                    log('_changes cancel');
                     complete = true;
+                    if (cancelLive) cancelLive();
                 }
             };
         };
@@ -387,16 +460,20 @@ export function GoogleDriveAdapter(PouchDB: any) {
         };
 
         api._getRevisionTree = function (docId: string, callback: any): void {
-            db.get(docId).then(doc => {
-                if (!doc) {
-                    return callback({ status: 404, error: true, name: 'not_found', message: 'missing' });
-                }
-                const revTree = [{
-                    pos: 1,
-                    ids: [doc._rev.split('-')[1], { status: 'available' }, []]
-                }];
-                callback(null, revTree);
-            }).catch(callback);
+            const entry = db.getIndexEntry(docId);
+            if (!entry) {
+                return callback({ status: 404, error: true, name: 'not_found', message: 'missing' });
+            }
+
+            // Return a minimal tree based on the known winning revision
+            const revNum = parseInt(entry.rev.split('-')[0], 10);
+            const revHash = entry.rev.split('-')[1];
+
+            const revTree = [{
+                pos: revNum,
+                ids: [revHash, { status: 'available' }, []]
+            }];
+            callback(null, revTree);
         };
 
         api._close = function (callback: () => void): void {

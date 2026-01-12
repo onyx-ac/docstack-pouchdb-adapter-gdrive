@@ -34,11 +34,12 @@ export default function GoogleDriveAdapter(config: GoogleDriveAdapterOptions) {
         ConfiguredAdapter.use_prefix = BaseAdapter.use_prefix;
 
         // Register the adapter manually
-        // We use PouchDB.adapters object directly to avoid using the .adapter() method
+        // Check if already registered to avoid overwriting or conflicts
         if (PouchDB.adapters) {
-            PouchDB.adapters['googledrive'] = ConfiguredAdapter;
+            if (!PouchDB.adapters['googledrive'] || PouchDB.adapters['googledrive'] !== ConfiguredAdapter) {
+                PouchDB.adapters['googledrive'] = ConfiguredAdapter;
+            }
         } else {
-            // Fallback/Warning if adapters object is somehow missing (should not happen in core)
             console.warn('PouchDB.adapters not found, unable to register googledrive adapter');
         }
     };

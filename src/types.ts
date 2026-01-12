@@ -19,6 +19,8 @@ export interface GoogleDriveAdapterOptions extends DriveClientOptions {
     compactionSizeThreshold?: number;
     /** Cache size (number of documents) */
     cacheSize?: number;
+    /** Enable debug logging */
+    debug?: boolean;
 }
 
 /** A single change entry in the append-only log */

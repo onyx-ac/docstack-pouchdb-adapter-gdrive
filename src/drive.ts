@@ -57,6 +57,18 @@ export class DriveHandler {
 
     private listeners: ((docs: Record<string, any>) => void)[] = [];
     private pollingInterval: NodeJS.Timeout | null = null;
+    private loadingPromise: Promise<void> | null = null;
+    private isPollingActive: boolean = false;
+    private fileCache: LRUCache<string, any>;
+    private processedLogIds: Set<string> = new Set();
+    private currentSnapshotIndexId: string | null = null;
+    private debug: boolean = false;
+
+    private log(...args: any[]) {
+        if (this.debug) console.log(`[googledrive-drive] [${this.meta.dbName}]`, ...args);
+    }
+
+
 
     constructor(options: GoogleDriveAdapterOptions, dbName: string) {
         this.client = new GoogleDriveClient(options);
@@ -67,8 +79,12 @@ export class DriveHandler {
         this.compactionThreshold = options.compactionThreshold || DEFAULT_COMPACTION_THRESHOLD;
         this.compactionSizeThreshold = options.compactionSizeThreshold || DEFAULT_SIZE_THRESHOLD;
         this.meta.dbName = dbName;
+        this.debug = !!options.debug;
 
         this.docCache = new LRUCache(options.cacheSize || DEFAULT_CACHE_SIZE);
+
+        this.fileCache = new LRUCache(100); // Cache for last 100 files
+
 
         // Polling will be started in load() after folderId is resolved
     }
@@ -80,71 +96,76 @@ export class DriveHandler {
 
     /** Load the database (Index Only) */
     async load(): Promise<void> {
-        if (!this.folderId) {
-            this.folderId = await this.findOrCreateFolder();
-        }
+        if (this.loadingPromise) return this.loadingPromise;
 
-        const metaFile = await this.findFile('_meta.json');
-        if (metaFile) {
-            this.meta = await this.downloadJson(metaFile.id);
-            this.metaEtag = metaFile.etag || null;
-            this.metaModifiedTime = metaFile.modifiedTime || null;
-        } else {
-            await this.saveMeta(this.meta);
-        }
-
-        // Initialize Index
-        this.index = {};
-
-        // 1. Load Snapshot Index
-        if (this.meta.snapshotIndexId) {
+        this.loadingPromise = (async () => {
             try {
-                // Try strictly as new format first
-                const snapshotIdx: SnapshotIndex = await this.downloadJson(this.meta.snapshotIndexId);
-                // Check if it's actually a legacy snapshot (has 'docs' with bodies)
-                if ((snapshotIdx as any).docs) {
-                    // Migration Path: Handle legacy snapshot
-                    this.filesFromLegacySnapshot(snapshotIdx as unknown as LegacySnapshotData);
+                if (!this.folderId) {
+                    this.folderId = await this.findOrCreateFolder();
+                }
+
+                const metaFile = await this.findFile('_meta.json');
+                if (metaFile) {
+                    this.meta = await this.downloadJson(metaFile.id);
+                    this.metaEtag = metaFile.etag || null;
+                    this.metaModifiedTime = metaFile.modifiedTime || null;
                 } else {
-                    this.index = snapshotIdx.entries || {};
-                    // We assume seq is synced with meta usually, but use snapshot's seq as base
+                    await this.saveMeta(this.meta);
                 }
-            } catch (e) {
-                console.warn('Failed to load snapshot index', e);
-                this.index = {};
-            }
-        } else if ((this.meta as any).snapshotId) {
-            // Legacy support: field was renamed
-            try {
-                const legacySnapshot = await this.downloadJson((this.meta as any).snapshotId);
-                this.filesFromLegacySnapshot(legacySnapshot);
-            } catch (e) {
-                console.warn('Failed to load legacy snapshot', e);
-            }
-        }
 
-        // 2. Replay Change Logs (Metadata only updates)
-        this.pendingChanges = [];
-        this.currentLogSizeEstimate = 0;
+                if (this.meta.snapshotIndexId !== this.currentSnapshotIndexId) {
+                    // Compaction occurred or initial load
+                    this.index = {};
+                    this.processedLogIds.clear();
+                    this.currentSnapshotIndexId = this.meta.snapshotIndexId;
 
-        for (const logId of this.meta.changeLogIds) {
-            const changes = await this.downloadNdjson(logId);
-            this.currentLogSizeEstimate += 100 * changes.length;
-
-            for (const change of changes) {
-                this.updateIndex(change, logId);
-                // We do NOT load body into cache automatically
-                // But we must invalidate cache if we had old data
-                if (this.docCache.get(change.id)) {
-                    this.docCache.remove(change.id);
+                    if (this.meta.snapshotIndexId) {
+                        try {
+                            const snapshotIdx: SnapshotIndex = await this.downloadJson(this.meta.snapshotIndexId);
+                            if ((snapshotIdx as any).docs) {
+                                this.filesFromLegacySnapshot(snapshotIdx as unknown as LegacySnapshotData);
+                            } else {
+                                this.index = snapshotIdx.entries || {};
+                            }
+                        } catch (e) {
+                            console.warn('Failed to load snapshot index', e);
+                        }
+                    } else if ((this.meta as any).snapshotId) {
+                        try {
+                            const legacySnapshot = await this.downloadJson((this.meta as any).snapshotId);
+                            this.filesFromLegacySnapshot(legacySnapshot);
+                        } catch (e) {
+                            console.warn('Failed to load legacy snapshot', e);
+                        }
+                    }
                 }
-            }
-        }
 
-        // 3. Start Polling (if enabled)
-        if (this.options.pollingIntervalMs) {
-            this.startPolling(this.options.pollingIntervalMs);
-        }
+                // 2. Replay NEW Change Logs (Metadata only updates)
+                for (const logId of this.meta.changeLogIds) {
+                    if (this.processedLogIds.has(logId)) continue;
+
+                    const changes = await this.downloadNdjson(logId);
+                    this.currentLogSizeEstimate += 100 * changes.length;
+
+                    for (const change of changes) {
+                        this.updateIndex(change, logId);
+                        if (this.docCache.get(change.id)) {
+                            this.docCache.remove(change.id);
+                        }
+                    }
+                    this.processedLogIds.add(logId);
+                }
+
+                // 3. Start Polling (if enabled)
+                if (this.options.pollingIntervalMs) {
+                    this.startPolling(this.options.pollingIntervalMs);
+                }
+            } finally {
+                this.loadingPromise = null;
+            }
+        })();
+
+        return this.loadingPromise;
     }
 
     // Migration helper
@@ -173,17 +194,12 @@ export class DriveHandler {
         if (!entry) return null;
         if (entry.deleted) return null;
 
-        // 1. Check Cache
-        const cached = this.docCache.get(id);
-        if (cached) return cached;
+        // 1. Check Doc Cache
+        const cachedDoc = this.docCache.get(id);
+        if (cachedDoc) return cachedDoc;
 
-        // 2. Fetch from Drive
-        // If it's a legacy entry currently in memory (should have been cached), returns null if evicted?
+        // 2. Fetch from Drive (via File Cache)
         if (entry.location.fileId === 'LEGACY_MEMORY') {
-            // If evicted, we are in trouble unless we re-download the legacy snapshot.
-            // For robustness, let's say we reload the legacy snapshot if needed.
-            // OR simpler: we assume compaction will fix this soon.
-            // Let's implement fetch for safety.
             if ((this.meta as any).snapshotId) {
                 const legacy = await this.downloadJson((this.meta as any).snapshotId);
                 if (legacy.docs[id]) {
@@ -191,39 +207,80 @@ export class DriveHandler {
                     return legacy.docs[id];
                 }
             }
-            return null; // Should not happen
+            return null;
         }
 
         const fileId = entry.location.fileId;
-
-        // Is it a change file (NDJSON) or snapshot file (JSON)?
-        // We can infer or we could have stored type. 
-        // Usually, we just download the file.
-        // Optimization: If we have many docs in one file, we might want to cache that file's contents?
-        // For now, naive fetch: download file, find doc.
-
-        const content = await this.downloadFileAny(fileId);
+        const content = await this.fetchFile(fileId);
 
         let doc: any = null;
         if (Array.isArray(content)) {
-            // It's a change log (array of entries)
-            // Find the *last* entry for this ID in this file
-            const match = content.reverse().find((c: ChangeEntry) => c.id === id);
+            // It's a change log (NDJSON parsed as array)
+            const match = [...content].reverse().find((c: ChangeEntry) => c.id === id);
             doc = match ? match.doc : null;
-        } else if (content.docs) {
+        } else if (content && content.docs) {
             // It's a snapshot-data chunk
             doc = content.docs[id];
-        } else {
-            // Single doc file? (Not used yet)
+        } else if (content && content.id === id && content.doc) {
+            // It's a single ChangeEntry object (parsed from single-line NDJSON)
+            doc = content.doc;
+        } else if (content && (content._id === id || content.id === id)) {
+            // Single doc file or raw doc body
             doc = content;
         }
 
         if (doc) {
             this.docCache.put(id, doc);
-            doc._rev = entry.rev; // Ensure consistent rev
+            doc._rev = entry.rev;
         }
 
         return doc;
+    }
+
+    /** Generic Download with Caching and Parsing */
+    private async fetchFile(fileId: string): Promise<any> {
+        const cached = this.fileCache.get(fileId);
+        if (cached) {
+            this.log('fetchFile cache hit', fileId);
+            return cached;
+        }
+
+        this.log('fetchFile downloading', fileId);
+        const data = await this.client.getFile(fileId);
+        let parsed: any;
+
+        if (typeof data === 'string') {
+            const trimmed = data.trim();
+            if (trimmed.startsWith('{')) {
+                // Could be JSON or NDJSON
+                if (trimmed.includes('\n')) {
+                    // Definitely NDJSON (multiple lines)
+                    try {
+                        const lines = trimmed.split('\n').filter(l => l);
+                        parsed = lines.map(line => JSON.parse(line));
+                    } catch (e) {
+                        parsed = data;
+                    }
+                } else {
+                    // Single line. Try regular JSON first.
+                    try {
+                        parsed = JSON.parse(trimmed);
+                        // Optional: if we know it was supposed to be NDJSON? 
+                        // Our change files are always NDJSON. 
+                        // But _meta.json and snapshot-*.json are regular JSON.
+                    } catch (e) {
+                        parsed = data;
+                    }
+                }
+            } else {
+                parsed = data;
+            }
+        } else {
+            parsed = data;
+        }
+
+        this.fileCache.put(fileId, parsed);
+        return parsed;
     }
 
     /** Get multiple docs (Atomic-ish) used for _allDocs */
@@ -262,14 +319,14 @@ export class DriveHandler {
         // Fetch files
         for (const [fileId, docIds] of Object.entries(byFile)) {
             try {
-                const content = await this.downloadFileAny(fileId);
+                const content = await this.fetchFile(fileId);
 
                 for (const docId of docIds) {
                     let doc = null;
                     if (Array.isArray(content)) {
-                        const match = content.reverse().find((c: ChangeEntry) => c.id === docId);
+                        const match = [...content].reverse().find((c: ChangeEntry) => c.id === docId);
                         doc = match ? match.doc : null;
-                    } else if (content.docs) {
+                    } else if (content && content.docs) {
                         doc = content.docs[docId];
                     }
 
@@ -525,23 +582,15 @@ export class DriveHandler {
     }
 
     private async downloadJson(fileId: string): Promise<any> {
-        return await this.client.getFile(fileId);
+        return await this.fetchFile(fileId);
     }
 
     private async downloadFileAny(fileId: string): Promise<any> {
-        return await this.client.getFile(fileId);
+        return await this.fetchFile(fileId);
     }
 
     private async downloadNdjson(fileId: string): Promise<ChangeEntry[]> {
-        const data = await this.client.getFile(fileId);
-        // data will likely be a string if NDJSON is returned and getFile sees weird content-type
-        // Or if getFile auto-parsed standard "application/json" but NDJSON is just text.
-        // Google Drive might return application/json for everything if we aren't careful?
-        // Actually .ndjson is separate.
-        // Safest: Handle string or object.
-        const content = typeof data === 'string' ? data : JSON.stringify(data);
-        const lines = content.trim().split('\n').filter((l: string) => l);
-        return lines.map((line: string) => JSON.parse(line));
+        return await this.fetchFile(fileId);
     }
 
     private async writeChangeFile(changes: ChangeEntry[]): Promise<string> {
@@ -592,15 +641,22 @@ export class DriveHandler {
     private startPolling(intervalMs: number): void {
         if (this.pollingInterval) clearInterval(this.pollingInterval);
         this.pollingInterval = setInterval(async () => {
+            if (this.isPollingActive) return;
+            this.isPollingActive = true;
             try {
                 const metaFile = await this.findFile('_meta.json');
                 if (!metaFile) return;
                 // Use modifiedTime for polling as it's readable in projections
                 if (metaFile.modifiedTime !== this.metaModifiedTime) {
+                    this.log('Polling detected change', metaFile.modifiedTime);
                     await this.load();
                     this.notifyListeners();
                 }
-            } catch (err) { console.error('Polling error', err); }
+            } catch (err) {
+                console.error('Polling error', err);
+            } finally {
+                this.isPollingActive = false;
+            }
         }, intervalMs);
     }
 
@@ -619,7 +675,13 @@ export class DriveHandler {
     }
 
     // For tests/debug
-    onChange(cb: any) { this.listeners.push(cb); }
+    onChange(cb: (changes: Record<string, any>) => void) {
+        this.listeners.push(cb);
+        return () => {
+            this.listeners = this.listeners.filter(l => l !== cb);
+        };
+    }
+
     stopPolling() { if (this.pollingInterval) clearInterval(this.pollingInterval); }
 
     private escapeQuery(value: string): string {
