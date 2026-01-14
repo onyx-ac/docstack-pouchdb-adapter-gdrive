@@ -65,7 +65,7 @@ export class DriveHandler {
     private debug: boolean = false;
 
     private log(...args: any[]) {
-        if (this.debug) console.log(`[googledrive-drive] [${this.meta.dbName}]`, ...args);
+        console.log(`[googledrive-drive] [${this.meta.dbName}]`, ...args);
     }
 
 
@@ -100,20 +100,28 @@ export class DriveHandler {
 
         this.loadingPromise = (async () => {
             try {
+                this.log('Loading database, options', { options: this.options });
                 if (!this.folderId) {
                     this.folderId = await this.findOrCreateFolder();
+                    this.log('Retrieved folder', { folderId: this.folderId });
                 }
 
                 const metaFile = await this.findFile('_meta.json');
                 if (metaFile) {
+                    this.log('Retrieved meta file', { fileId: metaFile.id });
                     this.meta = await this.downloadJson(metaFile.id);
                     this.metaEtag = metaFile.etag || null;
                     this.metaModifiedTime = metaFile.modifiedTime || null;
                 } else {
+                    this.log('Meta file not found, creating new');
                     await this.saveMeta(this.meta);
                 }
 
                 if (this.meta.snapshotIndexId !== this.currentSnapshotIndexId) {
+                    this.log('Snapshot index changed, loading index', {
+                        snapshotIndexId: this.meta.snapshotIndexId,
+                        currentSnapshotIndexId: this.currentSnapshotIndexId
+                    });
                     // Compaction occurred or initial load
                     this.index = {};
                     this.processedLogIds.clear();
@@ -131,6 +139,9 @@ export class DriveHandler {
                             console.warn('Failed to load snapshot index', e);
                         }
                     } else if ((this.meta as any).snapshotId) {
+                        this.log('Legacy snapshot found, loading index', {
+                            snapshotId: (this.meta as any).snapshotId
+                        });
                         try {
                             const legacySnapshot = await this.downloadJson((this.meta as any).snapshotId);
                             this.filesFromLegacySnapshot(legacySnapshot);
@@ -141,25 +152,39 @@ export class DriveHandler {
                 }
 
                 // 2. Replay NEW Change Logs (Metadata only updates)
+                this.log('Replaying change logs');
                 for (const logId of this.meta.changeLogIds) {
                     if (this.processedLogIds.has(logId)) continue;
-
-                    const changes = await this.downloadNdjson(logId);
+                    this.log('Replaying change log', logId);
+                    let changes = await this.downloadNdjson(logId);
+                    if (!Array.isArray(changes)) {
+                        this.log("Unexpected changes", { changes, logId });
+                        this.log('Downloaded changes not an array, wrapping/ignoring', typeof changes);
+                        changes = changes ? [changes] : []; // Fallback
+                    }
                     this.currentLogSizeEstimate += 100 * changes.length;
+                    this.log('Replayed change log', logId);
 
                     for (const change of changes) {
+                        this.log('Processing change, sequence', change.seq);
                         this.updateIndex(change, logId);
                         if (this.docCache.get(change.id)) {
                             this.docCache.remove(change.id);
                         }
                     }
                     this.processedLogIds.add(logId);
+                    this.log('Processed log', logId)
                 }
 
                 // 3. Start Polling (if enabled)
                 if (this.options.pollingIntervalMs) {
-                    this.startPolling(this.options.pollingIntervalMs);
+                    this.log('Starting polling with interval', this.options.pollingIntervalMs);
+                    this.startPolling(Number(this.options.pollingIntervalMs));
+                } else {
+                    this.log('Polling disabled (no interval provided)');
                 }
+            } catch (e) {
+                console.error('Failed to load database', e);
             } finally {
                 this.loadingPromise = null;
             }
@@ -639,21 +664,33 @@ export class DriveHandler {
     }
 
     private startPolling(intervalMs: number): void {
+        this.log('Starting polling with interval', { intervalMs });
+        if (isNaN(intervalMs) || intervalMs <= 0) return;
         if (this.pollingInterval) clearInterval(this.pollingInterval);
+
         this.pollingInterval = setInterval(async () => {
-            if (this.isPollingActive) return;
+            this.log('Polling tick...');
+            if (this.isPollingActive) {
+                this.log('Polling already in progress, skipping tick');
+                return;
+            }
             this.isPollingActive = true;
             try {
                 const metaFile = await this.findFile('_meta.json');
-                if (!metaFile) return;
-                // Use modifiedTime for polling as it's readable in projections
+                if (!metaFile) {
+                    this.log('Polling: _meta.json not found');
+                    return;
+                }
+
+                // Compare modified times
+                this.log('Polling: comparing', metaFile.modifiedTime, 'with', this.metaModifiedTime);
                 if (metaFile.modifiedTime !== this.metaModifiedTime) {
-                    this.log('Polling detected change', metaFile.modifiedTime);
+                    this.log('Polling detected change!', metaFile.modifiedTime);
                     await this.load();
                     this.notifyListeners();
                 }
             } catch (err) {
-                console.error('Polling error', err);
+                this.log('Polling error', err);
             } finally {
                 this.isPollingActive = false;
             }

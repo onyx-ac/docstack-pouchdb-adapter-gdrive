@@ -34,7 +34,50 @@ export function GoogleDriveAdapter(PouchDB: any) {
         let db: DriveHandler;
 
         // Initialize DriveHandler
+        console.log('Initializing DriveHandler with options:', adapterOpts);
         db = new DriveHandler(adapterOpts, name);
+
+        // Initialize instanceId synchronously to avoid race conditions during replication setup
+        instanceId = 'gdrive-' + name + '-' + Date.now().toString(36);
+
+        // Polyfill activeTasks to ensure replication works even if PouchDB core doesn't attach it
+        if (!api.activeTasks) {
+            class ActiveTasks {
+                _tasks: Record<string, any> = {};
+
+                add(task: any) {
+                    const id = Date.now().toString(36) + Math.random().toString(36).substring(2, 5);
+                    this._tasks[id] = task;
+                    this._tasks[id].created_at = new Date().toISOString();
+                    this._tasks[id].updated_at = new Date().toISOString();
+                    return id;
+                }
+
+                remove(id: string, err: any) {
+                    delete this._tasks[id];
+                }
+
+                update(id: string, update: any) {
+                    if (this._tasks[id]) {
+                        Object.assign(this._tasks[id], update);
+                        this._tasks[id].updated_at = new Date().toISOString();
+                    }
+                }
+
+                get(id: string) {
+                    return this._tasks[id];
+                }
+
+                list() {
+                    return Object.values(this._tasks);
+                }
+            }
+
+            // @ts-ignore
+            api.activeTasks = new ActiveTasks();
+        }
+
+
 
         // Wrap callback to ensure it's only called once
         let callbackCalled = false;
@@ -47,6 +90,13 @@ export function GoogleDriveAdapter(PouchDB: any) {
         const debug = adapterOpts.debug;
         const log = (...args: any[]) => { if (debug) console.log(`[googledrive-adapter] [${name}]`, ...args); };
 
+        log('Initializing with options:', {
+            folderId: adapterOpts.folderId,
+            folderName: adapterOpts.folderName,
+            pollingIntervalMs: adapterOpts.pollingIntervalMs,
+            debug: adapterOpts.debug
+        });
+
         // Load data from Drive and initialize
         db.load().then(() => {
             log('Database loaded');
@@ -58,7 +108,6 @@ export function GoogleDriveAdapter(PouchDB: any) {
 
         // After database is initialized
         function afterDBCreated() {
-            instanceId = 'gdrive-' + name + '-' + Date.now().toString(36);
             nextTick(function () {
                 onceCallback(null, api);
             });
@@ -106,9 +155,11 @@ export function GoogleDriveAdapter(PouchDB: any) {
             }
 
             // PouchDB sometimes asks for metadata only (revs, revs_info) 
-            log('_get', id);
+            log('_get id:', id, 'opts:', JSON.stringify(opts));
+
             db.get(id).then(doc => {
                 if (!doc) {
+                    log('_get missing', id);
                     return callback({
                         status: 404,
                         error: true,
@@ -117,10 +168,24 @@ export function GoogleDriveAdapter(PouchDB: any) {
                     });
                 }
 
+                // Support open_revs for bulkGet shim compatibility
+                if (opts.open_revs) {
+                    log('_get handling open_revs for:', id);
+                    // We currently only store the winning revision.
+                    // If open_revs='all' or includes our rev, return it.
+                    // TODO: Robust conflict support would check exact rev matching.
+                    const result = [{ ok: doc }];
+                    return callback(null, result);
+                }
+
+                log('_get returning standard doc for:', id);
                 // If only rev was requested? (Internal optimization)
                 // PouchDB core handles this if we return the full doc.
                 callback(null, { doc, metadata: { id: doc._id, rev: doc._rev, winningRev: doc._rev } });
-            }).catch(callback);
+            }).catch(e => {
+                log('_get error', e);
+                callback(e);
+            });
         };
 
         // Get all documents (Lazy stream or fetch)
@@ -202,11 +267,11 @@ export function GoogleDriveAdapter(PouchDB: any) {
         };
 
         // Bulk Get optimization for Replication
-        api._bulkGet = function (req: any, opts: any, callback: any): void {
-            const docs = req.docs;
+        api._bulkGet = function (opts: any, callback?: any): Promise<any> {
+            const docs = opts.docs;
             const ids = docs.map((d: any) => d.id);
 
-            db.getMulti(ids).then(results => {
+            return db.getMulti(ids).then(results => {
                 const response = {
                     results: ids.map((id: string, i: number) => {
                         const doc = results[i];
@@ -233,9 +298,15 @@ export function GoogleDriveAdapter(PouchDB: any) {
                         };
                     })
                 };
-                callback(null, response);
-            }).catch(callback);
+                if (callback) callback(null, response);
+                return response;
+            }).catch((err: any) => {
+                if (callback) callback(err);
+                throw err;
+            });
         };
+
+        api.bulkGet = api._bulkGet;
 
 
         // Bulk document operations
