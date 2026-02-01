@@ -1,6 +1,6 @@
 {
   "name": "@docstack/pouchdb-adapter-googledrive",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "PouchDB adapter for Google Drive",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",

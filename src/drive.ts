@@ -537,8 +537,11 @@ export class DriveHandler {
         const newIndexId = indexRes.id;
 
         // 4. Update Meta
+        let filesToDelete: string[] = [];
         await this.atomicUpdateMeta((latest) => {
             const remainingLogs = latest.changeLogIds.filter(id => !oldLogIds.includes(id));
+            // Only delete files that were in oldLogIds but not in remainingLogs
+            filesToDelete = oldLogIds.filter(id => !remainingLogs.includes(id));
             return {
                 ...latest,
                 snapshotIndexId: newIndexId,
@@ -547,8 +550,8 @@ export class DriveHandler {
             };
         });
 
-        // 5. Cleanup
-        this.cleanupOldFiles(oldIndexId, oldLogIds); // And potentially old data files if we tracked them
+        // 5. Cleanup - Only delete files that were confirmed removed from metadata
+        await this.cleanupOldFiles(oldIndexId, filesToDelete);
         this.currentLogSizeEstimate = 0;
     }
 
@@ -650,17 +653,42 @@ export class DriveHandler {
     }
 
     private async countTotalChanges(): Promise<number> {
-        // Calculate diff between meta.seq and snapshot seq
-        // But we don't store snapshot seq in meta directly?
-        // We can approximate by pending changes count + known gaps?
-        // Actually we used to check snapshot.seq. 
-        // We can assume snapshot is somewhat recent.
-        return this.pendingChanges.length + 10; // dummy for now, rely on log size
+        // If no snapshot exists yet, total changes = meta.seq (all changes)
+        // If snapshot exists, total changes = meta.seq - lastSnapshotSeq
+        // For now, if snapshotIndexId is null, count all changes since start
+        if (!this.meta.snapshotIndexId) {
+            // No snapshot yet - all changes count towards threshold
+            return this.meta.seq;
+        }
+        
+        // With snapshot, we could track lastSnapshotSeq in metadata
+        // For now, approximate by change log count * average
+        // Each log file typically contains multiple changes
+        return this.meta.changeLogIds.length * 5 + this.pendingChanges.length;
     }
 
-    private async cleanupOldFiles(oldIndexId: string | null, oldLogIds: string[]) {
-        if (oldIndexId) try { await this.client.deleteFile(oldIndexId); } catch { }
-        for (const id of oldLogIds) try { await this.client.deleteFile(id); } catch { }
+    private async cleanupOldFiles(oldIndexId: string | null, oldLogIds: string[]): Promise<void> {
+        const deleteFile = async (fileId: string) => {
+            try {
+                await this.client.deleteFile(fileId);
+                this.log('Deleted file', fileId);
+            } catch (err: any) {
+                // 404 is ok - file already deleted or doesn't exist
+                if (err.status === 404 || err.code === 404) {
+                    this.log('File already deleted or not found', fileId);
+                    return;
+                }
+                // Log other errors but don't fail
+                this.log('Failed to delete file', fileId, err);
+            }
+        };
+
+        if (oldIndexId) {
+            await deleteFile(oldIndexId);
+        }
+        for (const id of oldLogIds) {
+            await deleteFile(id);
+        }
     }
 
     private startPolling(intervalMs: number): void {

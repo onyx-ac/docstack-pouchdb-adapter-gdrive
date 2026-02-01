@@ -16,6 +16,11 @@ interface AdapterOptions extends GoogleDriveAdapterOptions {
 /** Callback type for adapter initialization */
 type AdapterCallback = (err: Error | null, api?: any) => void;
 
+
+/**
+ * TODO: Implement dynamic method signature, since PouchDB CRUD methods can be called as promise, callback or (?)
+ */
+
 /**
  * GoogleDriveAdapter - PouchDB adapter for Google Drive storage.
  * Updated for Lazy Loading (Async Access).
@@ -126,7 +131,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
         };
 
         // Info now must be async-ish (calculated from Index)
-        api._info = function (callback: (err: null, info: object) => void): void {
+        api._info = function (callback: any): Promise<any> | void {
             const keys = db.getIndexKeys();
             const docCount = keys.length; // Approximate (doesn't account for deleted unless filtered)
 
@@ -142,30 +147,44 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 update_seq: db.seq,
                 backend_adapter: 'googledrive'
             };
-            nextTick(function () {
-                callback(null, res);
-            });
+            
+            if (callback) {
+                nextTick(function () {
+                    callback(null, res);
+                });
+            } else {
+                return Promise.resolve(res);
+            }
         };
 
+        api.info = api._info;
+
         // Get a single document by ID (Async fetch)
-        api._get = function (id: string, opts: any, callback: any): void {
+        api._get = function (id: string, opts: any, callback: any): Promise<any> | void {
             if (typeof opts === 'function') {
                 callback = opts;
+                opts = {};
+            }
+            
+            // Ensure opts is always an object
+            if (!opts || typeof opts !== 'object') {
                 opts = {};
             }
 
             // PouchDB sometimes asks for metadata only (revs, revs_info) 
             log('_get id:', id, 'opts:', JSON.stringify(opts));
 
-            db.get(id).then(doc => {
+            const promise = db.get(id).then(doc => {
                 if (!doc) {
                     log('_get missing', id);
-                    return callback({
+                    const err = {
                         status: 404,
                         error: true,
                         name: 'not_found',
                         message: 'missing'
-                    });
+                    };
+                    if (callback) callback(err);
+                    throw err;
                 }
 
                 // Support open_revs for bulkGet shim compatibility
@@ -175,23 +194,36 @@ export function GoogleDriveAdapter(PouchDB: any) {
                     // If open_revs='all' or includes our rev, return it.
                     // TODO: Robust conflict support would check exact rev matching.
                     const result = [{ ok: doc }];
-                    return callback(null, result);
+                    if (callback) callback(null, result);
+                    return result;
                 }
 
                 log('_get returning standard doc for:', id);
                 // If only rev was requested? (Internal optimization)
                 // PouchDB core handles this if we return the full doc.
-                callback(null, { doc, metadata: { id: doc._id, rev: doc._rev, winningRev: doc._rev } });
+                const response = { doc, metadata: { id: doc._id, rev: doc._rev, winningRev: doc._rev } };
+                if (callback) callback(null, response);
+                return response;
             }).catch(e => {
                 log('_get error', e);
-                callback(e);
+                if (callback) callback(e);
+                throw e;
             });
+
+            return promise;
         };
 
+        api.get = api._get;
+
         // Get all documents (Lazy stream or fetch)
-        api._allDocs = function (opts: any, callback: any): void {
+        api._allDocs = function (opts: any, callback: any): Promise<any> | void {
             if (typeof opts === 'function') {
                 callback = opts;
+                opts = {};
+            }
+            
+            // Ensure opts is always an object
+            if (!opts || typeof opts !== 'object') {
                 opts = {};
             }
 
@@ -214,7 +246,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
 
             // Fetch actual docs if needed
             if (opts.include_docs) {
-                db.getMulti(sliced).then(docs => {
+                const promise = db.getMulti(sliced).then(docs => {
                     const rows = sliced.map((id, i) => {
                         const doc = docs[i];
                         const entry = db.getIndexEntry(id);
@@ -241,9 +273,14 @@ export function GoogleDriveAdapter(PouchDB: any) {
                         // CouchDB usually returns error row if distinct keys requested.
                     };
                     if (opts.update_seq) result.update_seq = db.seq;
-                    callback(null, result);
+                    if (callback) callback(null, result);
+                    return result;
 
-                }).catch(err => callback(err));
+                }).catch(err => {
+                    if (callback) callback(err);
+                    throw err;
+                });
+                return promise;
             } else {
                 // Index only (Fast!)
                 const rows = sliced.map(id => {
@@ -262,9 +299,17 @@ export function GoogleDriveAdapter(PouchDB: any) {
                     rows
                 };
                 if (opts.update_seq) result.update_seq = db.seq;
-                nextTick(() => callback(null, result));
+                
+                if (callback) {
+                    nextTick(() => callback(null, result));
+                    return Promise.resolve(result);
+                } else {
+                    return Promise.resolve(result);
+                }
             }
         };
+
+        api.allDocs = api._allDocs;
 
         // Bulk Get optimization for Replication
         api._bulkGet = function (opts: any, callback?: any): Promise<any> {
@@ -310,7 +355,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
 
 
         // Bulk document operations
-        api._bulkDocs = function (req: any, opts: any, callback: any): void {
+        api._bulkDocs = function (req: any, opts: any, callback: any): Promise<any> | void {
             const docs = req.docs;
             const results: any[] = [];
             const newEdits = opts.new_edits !== false;
@@ -380,13 +425,19 @@ export function GoogleDriveAdapter(PouchDB: any) {
 
             log('_bulkDocs flushing', changes.length, 'changes');
             // Append changes to log
-            db.appendChanges(changes).then(() => {
-                nextTick(() => callback(null, results));
+            const promise = db.appendChanges(changes).then(() => {
+                if (callback) nextTick(() => callback(null, results));
+                return results;
             }).catch((err: Error) => {
                 log('_bulkDocs error', err);
-                callback(err);
+                if (callback) callback(err);
+                throw err;
             });
+            
+            return promise;
         };
+
+        api.bulkDocs = api._bulkDocs;
 
         // Changes feed
         api._changes = function (opts: any): { cancel: () => void } {
@@ -399,83 +450,10 @@ export function GoogleDriveAdapter(PouchDB: any) {
             let lastSeq = since;
             let complete = false;
 
-            // Should we iterate Index or Logs?
-            // "Index" only has LATEST state. _changes usually wants history if `since` is old.
-            // But this adapter is an "Index + Log" adapter.
-            // If `since` is 0, we can walk the Index.
-            // If `since` is recent, we can maybe walk pending changes?
-            // Correct implementation of `_changes` with Append-Only Log requires reading the log files essentially.
-            // BUT, standard PouchDB `_changes` often just iterates all docs if it can't stream.
-            // For now, let's iterate the INDEX (Winning Revisions) which implies "since=0" behavior effectively (State of the World).
-
-            function processChanges(): void {
-                const keys = db.getIndexKeys(); // IDs
-                let processed = 0;
-
-                // Index-based iteration
-                for (const id of keys) {
-                    if (complete || processed >= limit) break;
-
-                    const entry = db.getIndexEntry(id);
-                    if (!entry) continue;
-
-                    // Filter by seq?
-                    if (entry.seq <= since) continue; // Already seen
-
-                    const change: any = {
-                        id: id,
-                        seq: entry.seq,
-                        changes: [{ rev: entry.rev }],
-                    };
-
-                    if (opts.include_docs) {
-                        // We need to fetch it!
-                        // This makes _changes with include_docs SLOW.
-                        // We can't do this synchronously here easily because `processChanges` is sync in original code?
-                        // Wait, original was `nextTick(processChanges)`.
-                        // We need to be async here.
-                    }
-
-                    // Supporting async processChanges is cleaner.
-                }
-                // ... This requires rewrite for async iteration ...
-            }
-
-            // Simplified Async Version
-            async function processChangesAsync() {
-                log('_changes processing since', since, 'limit', limit);
-                const keys = db.getIndexKeys();
-                let processed = 0;
-
-                for (const id of keys) {
-                    if (complete || processed >= limit) break;
-                    const entry = db.getIndexEntry(id);
-                    if (!entry || entry.seq <= since) continue;
-
-                    const change: any = {
-                        id: id,
-                        seq: entry.seq,
-                        changes: [{ rev: entry.rev }]
-                    };
-
-                    if (opts.include_docs) {
-                        change.doc = await db.get(id);
-                    }
-
-                    if (opts.onChange) opts.onChange(change);
-                    if (returnDocs) results.push(change);
-
-                    processed++;
-                    lastSeq = Math.max(lastSeq, entry.seq);
-                }
-
-                if (opts.complete && !complete && !opts.live) {
-                    opts.complete(null, { results, last_seq: lastSeq });
-                }
-            }
-
+            // Setup live listener FIRST (before emitting changes)
             let cancelLive: (() => void) | undefined;
             let liveListener: (changedDocs: Record<string, any>) => void;
+            
             if (opts.live) {
                 log('_changes setting up live listener');
                 liveListener = (changedDocs: Record<string, any>) => {
@@ -505,9 +483,50 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 cancelLive = db.onChange(liveListener);
             }
 
+            // Process initial changes
+            async function processChangesAsync() {
+                log('_changes processing since', since, 'limit', limit, 'live', !!opts.live);
+                const keys = db.getIndexKeys();
+                let processed = 0;
+
+                for (const id of keys) {
+                    if (complete || processed >= limit) break;
+                    const entry = db.getIndexEntry(id);
+                    if (!entry || entry.seq <= since) continue;
+
+                    const change: any = {
+                        id: id,
+                        seq: entry.seq,
+                        changes: [{ rev: entry.rev }]
+                    };
+
+                    if (opts.include_docs) {
+                        try {
+                            change.doc = await db.get(id);
+                        } catch (e) {
+                            log('_changes include_docs error', e);
+                        }
+                    }
+
+                    if (opts.onChange) opts.onChange(change);
+                    if (returnDocs) results.push(change);
+
+                    processed++;
+                    lastSeq = Math.max(lastSeq, entry.seq);
+                }
+
+                // ✅ CRITICAL FIX: Call opts.complete() for BOTH live and non-live modes
+                // PouchDB replication needs this callback to know when to start listening
+                if (opts.complete && !complete) {
+                    log('_changes calling complete callback with', { results_count: results.length, last_seq: lastSeq });
+                    opts.complete(null, { results, last_seq: lastSeq });
+                }
+            }
+
             nextTick(() => {
                 processChangesAsync().catch(err => {
                     log('_changes error', err);
+                    complete = true;
                     if (opts.complete) opts.complete(err);
                 });
             });
@@ -521,13 +540,19 @@ export function GoogleDriveAdapter(PouchDB: any) {
             };
         };
 
+        api.changes = api._changes;
+
         // Manual compaction trigger
-        api._compact = function (callback: any): void {
-            db.compact().then(() => {
-                callback(null, { ok: true });
+        api._compact = function (callback: any): Promise<any> | void {
+            const promise = db.compact().then(() => {
+                const result = { ok: true };
+                if (callback) callback(null, result);
+                return result;
             }).catch((err: Error) => {
-                callback(err);
+                if (callback) callback(err);
+                throw err;
             });
+            return promise;
         };
 
         api._getRevisionTree = function (docId: string, callback: any): void {
@@ -552,6 +577,8 @@ export function GoogleDriveAdapter(PouchDB: any) {
             nextTick(callback);
         };
 
+        api.close = api._close;
+
         api._destroy = function (opts: any, callback: any): void {
             if (typeof opts === 'function') {
                 callback = opts;
@@ -569,7 +596,9 @@ export function GoogleDriveAdapter(PouchDB: any) {
             }
         };
 
-        api._putLocal = function (doc: any, opts: any, callback: any): void {
+        api.destroy = api._destroy;
+
+        api._putLocal = function (doc: any, opts: any, callback: any): Promise<any> | void {
             if (typeof opts === 'function') {
                 callback = opts;
                 opts = {};
@@ -586,21 +615,34 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 timestamp: Date.now()
             };
 
-            db.appendChanges([change]).then(() => { // Using appendChanges wrapper
-                callback(null, { ok: true, id, rev });
+            const promise = db.appendChanges([change]).then(() => { // Using appendChanges wrapper
+                const result = { ok: true, id, rev };
+                if (callback) callback(null, result);
+                return result;
             }).catch((err: Error) => {
-                callback(err);
+                if (callback) callback(err);
+                throw err;
             });
+            return promise;
         };
 
-        api._getLocal = function (id: string, callback: any): void {
-            db.get(id).then(doc => {
-                if (!doc) return callback({ status: 404, error: true, name: 'not_found' });
-                callback(null, doc);
-            }).catch(callback);
+        api._getLocal = function (id: string, callback: any): Promise<any> | void {
+            const promise = db.get(id).then(doc => {
+                if (!doc) {
+                    const err = { status: 404, error: true, name: 'not_found' };
+                    if (callback) callback(err);
+                    throw err;
+                }
+                if (callback) callback(null, doc);
+                return doc;
+            }).catch(err => {
+                if (callback) callback(err);
+                throw err;
+            });
+            return promise;
         };
 
-        api._removeLocal = function (doc: any, opts: any, callback: any): void {
+        api._removeLocal = function (doc: any, opts: any, callback: any): Promise<any> | void {
             // ... Similar async update ...
             if (typeof opts === 'function') {
                 callback = opts;
@@ -609,7 +651,9 @@ export function GoogleDriveAdapter(PouchDB: any) {
             const id = doc._id;
             // Check existence async if we want to be strict, but index check is ok
             if (!db.getIndexEntry(id)) {
-                return callback({ status: 404, error: true, name: 'not_found' });
+                const err = { status: 404, error: true, name: 'not_found' };
+                if (callback) callback(err);
+                return Promise.reject(err);
             }
             // ...
             // Simplified removeLocal
@@ -620,11 +664,15 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 deleted: true,
                 timestamp: Date.now()
             };
-            db.appendChanges([change]).then(() => {
-                callback(null, { ok: true, id, rev: '0-0' });
+            const promise = db.appendChanges([change]).then(() => {
+                const result = { ok: true, id, rev: '0-0' };
+                if (callback) callback(null, result);
+                return result;
             }).catch((err: Error) => {
-                callback(err);
+                if (callback) callback(err);
+                throw err;
             });
+            return promise;
         };
     }
 
