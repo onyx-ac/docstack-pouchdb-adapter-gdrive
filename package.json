@@ -6,7 +6,8 @@
   "types": "lib/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test": "jest"
+    "test": "jest",
+    "test:prod": "TEST_ENV=production jest"
   },
   "keywords": [
     "pouchdb",
@@ -30,11 +31,16 @@
     "pouchdb-core": "^7.3.1"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/jest": "^30.0.0",
     "@types/node": "^20.0.0",
+    "@types/pouchdb-adapter-memory": "^6.1.6",
     "@types/pouchdb-core": "^7.0.15",
+    "@types/pouchdb-replication": "^6.4.7",
     "dotenv": "^17.2.3",
+    "express": "^5.2.1",
     "jest": "^30.2.0",
+    "pouchdb-adapter-memory": "^9.0.0",
     "pouchdb-replication": "^9.0.0",
     "ts-jest": "^29.4.6",
     "typescript": "^5.0.0"

@@ -6,4 +6,6 @@ tsconfig.json
 jest.config.json
 package-lock.json
 tests/
+tests-src/
 *.txt
+.env

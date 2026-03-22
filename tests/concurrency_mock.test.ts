@@ -57,7 +57,8 @@ describe('Concurrency & Race Conditions', () => {
                     const id = fileId;
                     const file = mockStorage[id];
 
-                    if (expectedEtag && expectedEtag !== mockEtags[id]) {
+                    const actualExpectedEtag = expectedEtag ? expectedEtag.replace(/"/g, '') : undefined;
+                    if (actualExpectedEtag && actualExpectedEtag !== mockEtags[id]) {
                         const err: any = new Error('Precondition Failed');
                         err.status = 412;
                         throw err;

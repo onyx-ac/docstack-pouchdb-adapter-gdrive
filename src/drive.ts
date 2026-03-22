@@ -63,6 +63,7 @@ export class DriveHandler {
     private processedLogIds: Set<string> = new Set();
     private currentSnapshotIndexId: string | null = null;
     private debug: boolean = false;
+    private isCompacting: boolean = false;
 
     private log(...args: any[]) {
         console.log(`[googledrive-drive] [${this.meta.dbName}]`, ...args);
@@ -71,7 +72,30 @@ export class DriveHandler {
 
 
     constructor(options: GoogleDriveAdapterOptions, dbName: string) {
-        this.client = new GoogleDriveClient(options);
+        const clientOptions = { ...options };
+        if (options.testMode) {
+            const serverUrl = options.testServerUrl || 'http://localhost:3000';
+            // @ts-ignore - baseUrl/uploadUrl might not be in the strict type if we didn't update types.ts definition for DriveClientOptions in client.ts yet? 
+            // We did update DriveClientOptions in client.ts.
+            // But GoogleDriveAdapterOptions extends DriveClientOptions?
+            // types.ts: export interface GoogleDriveAdapterOptions extends DriveClientOptions
+            // client.ts: export interface DriveClientOptions { accessToken: ...; baseUrl?: string; uploadUrl?: string; }
+            // So typescript should be happy.
+
+            // Using /drive/v3/files as base for the test server if simplified?
+            // The TestServer mounts at /drive/v3/files.
+            // But the client appends /drive/v3/files to BASE_URL? 
+            // In client.ts default is `https://www.googleapis.com/drive/v3/files`.
+            // Our TestServer mounts `/drive/v3/files`.
+            // So testUrl should be `http://localhost:3000/drive/v3/files`.
+            const testBase = `${serverUrl}/drive/v3/files`;
+            const testUpload = `${serverUrl}/upload/drive/v3/files`;
+            // @ts-ignore
+            clientOptions.baseUrl = testBase;
+            // @ts-ignore
+            clientOptions.uploadUrl = testUpload;
+        }
+        this.client = new GoogleDriveClient(clientOptions);
         this.options = options;
         this.folderId = options.folderId || null;
         this.folderName = options.folderName || dbName;
@@ -109,7 +133,7 @@ export class DriveHandler {
                 const metaFile = await this.findFile('_meta.json');
                 if (metaFile) {
                     this.log('Retrieved meta file', { fileId: metaFile.id });
-                    this.meta = await this.downloadJson(metaFile.id);
+                    this.meta = await this.downloadJson(metaFile.id, true); // No cache for meta
                     this.metaEtag = metaFile.etag || null;
                     this.metaModifiedTime = metaFile.modifiedTime || null;
                 } else {
@@ -185,6 +209,7 @@ export class DriveHandler {
                 }
             } catch (e) {
                 console.error('Failed to load database', e);
+                throw e;
             } finally {
                 this.loadingPromise = null;
             }
@@ -263,11 +288,13 @@ export class DriveHandler {
     }
 
     /** Generic Download with Caching and Parsing */
-    private async fetchFile(fileId: string): Promise<any> {
-        const cached = this.fileCache.get(fileId);
-        if (cached) {
-            this.log('fetchFile cache hit', fileId);
-            return cached;
+    private async fetchFile(fileId: string, skipCache: boolean = false): Promise<any> {
+        if (!skipCache) {
+            const cached = this.fileCache.get(fileId);
+            if (cached) {
+                this.log('fetchFile cache hit', fileId);
+                return cached;
+            }
         }
 
         this.log('fetchFile downloading', fileId);
@@ -353,6 +380,9 @@ export class DriveHandler {
                         doc = match ? match.doc : null;
                     } else if (content && content.docs) {
                         doc = content.docs[docId];
+                    } else if (content && content.id === docId && content.doc) {
+                        // Single ChangeEntry object
+                        doc = content.doc;
                     }
 
                     if (doc) {
@@ -375,7 +405,8 @@ export class DriveHandler {
     }
 
     /** Return all keys in Index */
-    getIndexKeys(): string[] {
+    async getIndexKeys(): Promise<string[]> {
+        if (this.loadingPromise) await this.loadingPromise;
         return Object.keys(this.index);
     }
 
@@ -424,32 +455,37 @@ export class DriveHandler {
         // 1. Write Log File (Upload Data)
         const fileId = await this.writeChangeFile(changes);
 
-        // 2. Prepare speculative meta update
-        const nextMeta = { ...this.meta };
-        nextMeta.changeLogIds = [...nextMeta.changeLogIds, fileId];
-        nextMeta.seq = changes[changes.length - 1].seq;
+        try {
+            // 2. Prepare speculative meta update
+            const nextMeta = { ...this.meta };
+            nextMeta.changeLogIds = [...nextMeta.changeLogIds, fileId];
+            nextMeta.seq = changes[changes.length - 1].seq;
 
-        // 3. Commit Lock
-        await this.saveMeta(nextMeta, this.metaEtag);
+            // 3. Commit Lock
+            await this.saveMeta(nextMeta, this.metaEtag);
 
-        // 4. Update Local State
-        this.meta = nextMeta;
+            // 4. Update Local State
+            this.meta = nextMeta;
 
-        for (const change of changes) {
-            this.updateIndex(change, fileId);
-            if (change.doc) {
-                this.docCache.put(change.id, change.doc);
-            } else if (change.deleted) {
-                this.docCache.remove(change.id);
+            for (const change of changes) {
+                this.updateIndex(change, fileId);
+                if (change.doc) {
+                    this.docCache.put(change.id, change.doc);
+                } else if (change.deleted) {
+                    this.docCache.remove(change.id);
+                }
             }
-        }
 
-        // 5. Compaction Check
-        // Count changes since last compaction *pointer*, not just list length
-        const totalChanges = await this.countTotalChanges();
-        if (totalChanges >= this.compactionThreshold ||
-            this.currentLogSizeEstimate >= this.compactionSizeThreshold) {
-            this.compact().catch(e => console.error('Compaction failed', e));
+            // 5. Compaction Check
+            const totalChanges = await this.countTotalChanges();
+            if (totalChanges >= this.compactionThreshold ||
+                this.currentLogSizeEstimate >= this.compactionSizeThreshold) {
+                this.compact().catch(e => console.error('Compaction failed', e));
+            }
+        } catch (err) {
+            // Cleanup orphaned log file on metadata update failure
+            this.client.deleteFile(fileId).catch(e => this.log('Failed to cleanup orphaned log', fileId, e));
+            throw err;
         }
     }
 
@@ -483,7 +519,11 @@ export class DriveHandler {
 
     /** Compact: Create SnapshotIndex + SnapshotData */
     async compact(): Promise<void> {
-        const snapshotSeq = this.meta.seq;
+        if (this.isCompacting) return;
+        this.isCompacting = true;
+        try {
+            this.log('Starting compaction');
+            const snapshotSeq = this.meta.seq;
         const oldLogIds = [...this.meta.changeLogIds];
         const oldIndexId = this.meta.snapshotIndexId;
 
@@ -553,6 +593,9 @@ export class DriveHandler {
         // 5. Cleanup - Only delete files that were confirmed removed from metadata
         await this.cleanupOldFiles(oldIndexId, filesToDelete);
         this.currentLogSizeEstimate = 0;
+        } finally {
+            this.isCompacting = false;
+        }
     }
 
     // ... Helpers (atomicUpdateMeta, saveMeta, writeChangeFile same as before) ...
@@ -564,7 +607,7 @@ export class DriveHandler {
             try {
                 const metaFile = await this.findFile('_meta.json');
                 if (!metaFile) throw new Error('Meta missing');
-                const validMeta = await this.downloadJson(metaFile.id);
+                const validMeta = await this.downloadJson(metaFile.id, true); // No cache
                 const newMeta = modifier(validMeta);
                 await this.saveMeta(newMeta, metaFile.etag);
                 this.meta = newMeta;
@@ -601,16 +644,27 @@ export class DriveHandler {
         const safeName = this.escapeQuery(name);
         const q = `name = '${safeName}' and '${this.folderId}' in parents and trashed = false`;
         const files = await this.client.listFiles(q);
-        if (files.length > 0) return {
-            id: files[0].id,
-            etag: files[0].etag || '',
-            modifiedTime: files[0].modifiedTime || ''
-        };
+        if (files.length > 0) {
+            let file = files[0];
+            if (!file.etag) {
+                // Robustness: Fetch metadata for the file if etag is missing from list
+                try {
+                    file = await this.client.getFileMetadata(file.id);
+                } catch (e) {
+                    this.log('Failed to fetch file metadata for etag', file.id, e);
+                }
+            }
+            return {
+                id: file.id,
+                etag: file.etag,
+                modifiedTime: file.modifiedTime
+            } as any;
+        }
         return null;
     }
 
-    private async downloadJson(fileId: string): Promise<any> {
-        return await this.fetchFile(fileId);
+    private async downloadJson(fileId: string, skipCache: boolean = false): Promise<any> {
+        return await this.fetchFile(fileId, skipCache);
     }
 
     private async downloadFileAny(fileId: string): Promise<any> {
@@ -645,6 +699,7 @@ export class DriveHandler {
             const res = await this.client.updateFile(metaFile.id, content, expectedEtag || undefined);
             this.metaEtag = res.etag;
             this.metaModifiedTime = res.modifiedTime;
+            this.fileCache.remove(metaFile.id); // Invalidate cache
         } else {
             const res = await this.client.createFile('_meta.json', [this.folderId!], 'application/json', content);
             this.metaEtag = res.etag;
@@ -654,17 +709,18 @@ export class DriveHandler {
 
     private async countTotalChanges(): Promise<number> {
         // If no snapshot exists yet, total changes = meta.seq (all changes)
-        // If snapshot exists, total changes = meta.seq - lastSnapshotSeq
-        // For now, if snapshotIndexId is null, count all changes since start
         if (!this.meta.snapshotIndexId) {
-            // No snapshot yet - all changes count towards threshold
             return this.meta.seq;
         }
-        
-        // With snapshot, we could track lastSnapshotSeq in metadata
-        // For now, approximate by change log count * average
-        // Each log file typically contains multiple changes
-        return this.meta.changeLogIds.length * 5 + this.pendingChanges.length;
+
+        // Each log file ID in changeLogIds represents some number of changes.
+        // For simplicity and to trigger compaction based on file count (which is what matters for Drive),
+        // we can return the number of log files. 
+        // But since compactionThreshold is usually in ENTRIES, let's keep a rough estimate
+        // or just return the log file count if that's what the user expects.
+        // The previous "* 5" was too aggressive. 
+        // Let's assume on average 1 change per log file in tests (worst case).
+        return this.meta.changeLogIds.length + this.pendingChanges.length;
     }
 
     private async cleanupOldFiles(oldIndexId: string | null, oldLogIds: string[]): Promise<void> {

@@ -21,6 +21,10 @@ export interface GoogleDriveAdapterOptions extends DriveClientOptions {
     cacheSize?: number;
     /** Enable debug logging */
     debug?: boolean;
+    /** Enable test mode (emulates Google Drive API) */
+    testMode?: boolean;
+    /** Test server URL (defaults to http://localhost:3000) */
+    testServerUrl?: string;
 }
 
 /** A single change entry in the append-only log */

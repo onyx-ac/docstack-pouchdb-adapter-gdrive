@@ -10,10 +10,12 @@ export interface DriveFile {
 
 export interface DriveClientOptions {
     accessToken: string | (() => Promise<string>);
+    baseUrl?: string;
+    uploadUrl?: string;
 }
 
-const BASE_URL = 'https://www.googleapis.com/drive/v3/files';
-const UPLOAD_URL = 'https://www.googleapis.com/upload/drive/v3/files';
+const DEFAULT_BASE_URL = 'https://www.googleapis.com/drive/v3/files';
+const DEFAULT_UPLOAD_URL = 'https://www.googleapis.com/upload/drive/v3/files';
 
 export class GoogleDriveClient {
     constructor(private options: DriveClientOptions) { }
@@ -28,12 +30,17 @@ export class GoogleDriveClient {
     private async fetch(url: string, init: RequestInit): Promise<Response> {
         const method = init.method || 'GET';
         const token = await this.getToken();
-        const headers = new Headers(init.headers);
-        headers.set('Authorization', `Bearer ${token}`);
+        const validHeaders: Record<string, string> = {
+            'Authorization': `Bearer ${token}`
+        };
+        if (init.headers) {
+            // manual merge if needed, or just iterate
+            new Headers(init.headers).forEach((v, k) => validHeaders[k] = v);
+        }
 
         let res: Response;
         try {
-            res = await fetch(url, { ...init, headers });
+            res = await fetch(url, { ...init, headers: validHeaders });
         } catch (networkErr: any) {
             const err: any = new Error(`Network Error: ${networkErr.message} (${method} ${url})`);
             err.code = 'network_error';
@@ -71,6 +78,14 @@ export class GoogleDriveClient {
         return res;
     }
 
+    private get baseUrl(): string {
+        return this.options.baseUrl || DEFAULT_BASE_URL;
+    }
+
+    private get uploadUrl(): string {
+        return this.options.uploadUrl || DEFAULT_UPLOAD_URL;
+    }
+
     async listFiles(q: string): Promise<DriveFile[]> {
         const params = new URLSearchParams({
             q,
@@ -79,7 +94,8 @@ export class GoogleDriveClient {
         // FIX: URLSearchParams uses '+', but Drive API is safer with '%20'
         const queryString = params.toString().replace(/\+/g, '%20');
 
-        const res = await this.fetch(`${BASE_URL}?${queryString}`, { method: 'GET' });
+        console.log(`[GoogleDriveClient] listFiles query: ${queryString}`);
+        const res = await this.fetch(`${this.baseUrl}?${queryString}`, { method: 'GET' });
         const data = await res.json();
         return data.files || [];
     }
@@ -89,7 +105,7 @@ export class GoogleDriveClient {
         try {
             const params = new URLSearchParams({ alt: 'media' });
             const queryString = params.toString().replace(/\+/g, '%20');
-            const res = await this.fetch(`${BASE_URL}/${fileId}?${queryString}`, { method: 'GET' });
+            const res = await this.fetch(`${this.baseUrl}/${fileId}?${queryString}`, { method: 'GET' });
             // Standard fetch handles JSON/Text transparency? 
             // We expect JSON mostly, but sometimes we might want text.
             // PouchDB adapter flow: downloadJson, downloadNdjson
@@ -110,8 +126,12 @@ export class GoogleDriveClient {
     async getFileMetadata(fileId: string): Promise<DriveFile> {
         const params = new URLSearchParams({ fields: 'id,name,mimeType,parents,modifiedTime' });
         const queryString = params.toString().replace(/\+/g, '%20');
-        const res = await this.fetch(`${BASE_URL}/${fileId}?${queryString}`, { method: 'GET' });
-        return await res.json();
+        const res = await this.fetch(`${this.baseUrl}/${fileId}?${queryString}`, { method: 'GET' });
+        const data = await res.json();
+        return {
+            ...data,
+            etag: this.extractEtag(res, data)
+        };
     }
 
     async createFile(name: string, parents: string[] | undefined, mimeType: string, content: string): Promise<{ id: string, etag: string, modifiedTime: string }> {
@@ -123,7 +143,7 @@ export class GoogleDriveClient {
 
         // Folders or empty content can use simple metadata-only POST
         if (!content && mimeType === 'application/vnd.google-apps.folder') {
-            const res = await this.fetch(`${BASE_URL}?fields=id,modifiedTime`, {
+            const res = await this.fetch(`${this.baseUrl}?fields=id,modifiedTime`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(metadata)
@@ -131,14 +151,14 @@ export class GoogleDriveClient {
             const data = await res.json();
             return {
                 id: data.id,
-                etag: data.etag || '',
-                modifiedTime: data.modifiedTime || ''
+                etag: this.extractEtag(res, data),
+                modifiedTime: data.modifiedTime || res.headers.get('Last-Modified') || ''
             };
         }
 
         const multipartBody = this.buildMultipart(metadata, content, mimeType);
 
-        const res = await this.fetch(`${UPLOAD_URL}?uploadType=multipart&fields=id,modifiedTime`, {
+        const res = await this.fetch(`${this.uploadUrl}?uploadType=multipart&fields=id,modifiedTime`, {
             method: 'POST',
             headers: {
                 'Content-Type': `multipart/related; boundary=${multipartBody.boundary}`
@@ -148,29 +168,37 @@ export class GoogleDriveClient {
         const data = await res.json();
         return {
             id: data.id,
-            etag: data.etag || '',
-            modifiedTime: data.modifiedTime || ''
+            etag: this.extractEtag(res, data),
+            modifiedTime: data.modifiedTime || res.headers.get('Last-Modified') || ''
         };
     }
 
     async updateFile(fileId: string, content: string, expectedEtag?: string): Promise<{ id: string, etag: string, modifiedTime: string }> {
         // Update content (media) usually, but sometimes meta?
         // In our usage (saveMeta), we update body.
-        const res = await this.fetch(`${UPLOAD_URL}/${fileId}?uploadType=media&fields=id,modifiedTime`, {
+        const res = await this.fetch(`${this.uploadUrl}/${fileId}?uploadType=media&fields=id,modifiedTime`, {
             method: 'PATCH',
-            headers: expectedEtag ? { 'If-Match': expectedEtag, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' },
+            headers: expectedEtag ? { 'If-Match': `"${expectedEtag}"`, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' },
             body: content
         });
         const data = await res.json();
         return {
             id: data.id,
-            etag: data.etag || '',
-            modifiedTime: data.modifiedTime || ''
+            etag: this.extractEtag(res, data),
+            modifiedTime: data.modifiedTime || res.headers.get('Last-Modified') || ''
         };
     }
 
+    private extractEtag(res: Response, data: any): string {
+        const headerEtag = res.headers.get('ETag');
+        if (headerEtag) {
+            return headerEtag.replace(/"/g, '');
+        }
+        return data.etag || '';
+    }
+
     async deleteFile(fileId: string): Promise<void> {
-        await this.fetch(`${BASE_URL}/${fileId}`, { method: 'DELETE' });
+        await this.fetch(`${this.baseUrl}/${fileId}`, { method: 'DELETE' });
     }
 
     private buildMultipart(metadata: any, content: string, contentType: string): { body: string, boundary: string } {

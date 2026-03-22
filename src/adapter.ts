@@ -5,7 +5,9 @@ import { DriveHandler } from './drive';
  * Schedule a function to run asynchronously.
  */
 function nextTick(fn: () => void): void {
-    queueMicrotask(fn);
+    if (typeof fn === 'function') {
+        queueMicrotask(fn);
+    }
 }
 
 /** Combined options type for PouchDB adapter */
@@ -132,28 +134,30 @@ export function GoogleDriveAdapter(PouchDB: any) {
 
         // Info now must be async-ish (calculated from Index)
         api._info = function (callback: any): Promise<any> | void {
-            const keys = db.getIndexKeys();
-            const docCount = keys.length; // Approximate (doesn't account for deleted unless filtered)
+            // Need to handle promise if it returns one
+            const promise = Promise.resolve().then(async () => {
+                const keys = await db.getIndexKeys();
+                const docCount = keys.length; // Approximate (doesn't account for deleted unless filtered)
 
-            // Filter deleted for accurate count
-            let alive = 0;
-            for (const k of keys) {
-                const entry = db.getIndexEntry(k);
-                if (entry && !entry.deleted) alive++;
-            }
+                // Filter deleted for accurate count
+                let alive = 0;
+                for (const k of keys) {
+                    const entry = db.getIndexEntry(k);
+                    if (entry && !entry.deleted) alive++;
+                }
 
-            const res = {
-                doc_count: alive,
-                update_seq: db.seq,
-                backend_adapter: 'googledrive'
-            };
-            
+                return {
+                    db_name: name,
+                    doc_count: alive,
+                    update_seq: db.seq,
+                    backend_adapter: 'googledrive'
+                };
+            });
+
             if (callback) {
-                nextTick(function () {
-                    callback(null, res);
-                });
+                promise.then(res => callback(null, res)).catch(err => callback(err));
             } else {
-                return Promise.resolve(res);
+                return promise;
             }
         };
 
@@ -165,7 +169,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 callback = opts;
                 opts = {};
             }
-            
+
             // Ensure opts is always an object
             if (!opts || typeof opts !== 'object') {
                 opts = {};
@@ -201,7 +205,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 log('_get returning standard doc for:', id);
                 // If only rev was requested? (Internal optimization)
                 // PouchDB core handles this if we return the full doc.
-                const response = { doc, metadata: { id: doc._id, rev: doc._rev, winningRev: doc._rev } };
+                const response = doc;
                 if (callback) callback(null, response);
                 return response;
             }).catch(e => {
@@ -221,32 +225,33 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 callback = opts;
                 opts = {};
             }
-            
+
             // Ensure opts is always an object
             if (!opts || typeof opts !== 'object') {
                 opts = {};
             }
 
-            const keys = db.getIndexKeys();
-            const total = keys.length; // Total keys (including deleted?)
+            const promise = (async () => {
+                const keys = await db.getIndexKeys();
+                const total = keys.length; // Total keys (including deleted?)
 
-            let startIndex = opts.skip || 0;
-            let limit = typeof opts.limit === 'number' ? opts.limit : keys.length;
+                let startIndex = opts.skip || 0;
+                let limit = typeof opts.limit === 'number' ? opts.limit : keys.length;
 
-            let filteredKeys = keys;
-            if (opts.startkey) filteredKeys = filteredKeys.filter(k => k >= opts.startkey);
-            if (opts.endkey) filteredKeys = filteredKeys.filter(k => k <= opts.endkey);
-            if (opts.key) filteredKeys = filteredKeys.filter(k => k === opts.key);
-            if (opts.keys) filteredKeys = opts.keys;
+                let filteredKeys = keys;
+                if (opts.startkey) filteredKeys = filteredKeys.filter(k => k >= opts.startkey);
+                if (opts.endkey) filteredKeys = filteredKeys.filter(k => k <= opts.endkey);
+                if (opts.key) filteredKeys = filteredKeys.filter(k => k === opts.key);
+                if (opts.keys) filteredKeys = opts.keys;
 
-            filteredKeys.sort();
-            if (opts.descending) filteredKeys.reverse();
+                filteredKeys.sort();
+                if (opts.descending) filteredKeys.reverse();
 
-            const sliced = filteredKeys.slice(startIndex, startIndex + limit);
+                const sliced = filteredKeys.slice(startIndex, startIndex + limit);
 
-            // Fetch actual docs if needed
-            if (opts.include_docs) {
-                const promise = db.getMulti(sliced).then(docs => {
+                // Fetch actual docs if needed
+                if (opts.include_docs) {
+                    const docs = await db.getMulti(sliced);
                     const rows = sliced.map((id, i) => {
                         const doc = docs[i];
                         const entry = db.getIndexEntry(id);
@@ -273,39 +278,34 @@ export function GoogleDriveAdapter(PouchDB: any) {
                         // CouchDB usually returns error row if distinct keys requested.
                     };
                     if (opts.update_seq) result.update_seq = db.seq;
-                    if (callback) callback(null, result);
                     return result;
 
-                }).catch(err => {
-                    if (callback) callback(err);
-                    throw err;
-                });
-                return promise;
-            } else {
-                // Index only (Fast!)
-                const rows = sliced.map(id => {
-                    const entry = db.getIndexEntry(id);
-                    if (!entry || entry.deleted) return { key: id, error: 'not_found' };
-                    return {
-                        id,
-                        key: id,
-                        value: { rev: entry.rev }
-                    };
-                });
-
-                const result: any = {
-                    total_rows: total,
-                    offset: startIndex,
-                    rows
-                };
-                if (opts.update_seq) result.update_seq = db.seq;
-                
-                if (callback) {
-                    nextTick(() => callback(null, result));
-                    return Promise.resolve(result);
                 } else {
-                    return Promise.resolve(result);
+                    // Index only (Fast!)
+                    const rows = sliced.map(id => {
+                        const entry = db.getIndexEntry(id);
+                        if (!entry || entry.deleted) return { key: id, error: 'not_found' };
+                        return {
+                            id,
+                            key: id,
+                            value: { rev: entry.rev }
+                        };
+                    });
+
+                    const result: any = {
+                        total_rows: total,
+                        offset: startIndex,
+                        rows
+                    };
+                    if (opts.update_seq) result.update_seq = db.seq;
+                    return result;
                 }
+            })();
+
+            if (callback) {
+                promise.then(res => callback(null, res)).catch(err => callback(err));
+            } else {
+                return promise;
             }
         };
 
@@ -433,7 +433,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 if (callback) callback(err);
                 throw err;
             });
-            
+
             return promise;
         };
 
@@ -453,7 +453,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
             // Setup live listener FIRST (before emitting changes)
             let cancelLive: (() => void) | undefined;
             let liveListener: (changedDocs: Record<string, any>) => void;
-            
+
             if (opts.live) {
                 log('_changes setting up live listener');
                 liveListener = (changedDocs: Record<string, any>) => {
@@ -486,7 +486,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
             // Process initial changes
             async function processChangesAsync() {
                 log('_changes processing since', since, 'limit', limit, 'live', !!opts.live);
-                const keys = db.getIndexKeys();
+                const keys = await db.getIndexKeys();
                 let processed = 0;
 
                 for (const id of keys) {
@@ -523,12 +523,11 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 }
             }
 
-            nextTick(() => {
-                processChangesAsync().catch(err => {
-                    log('_changes error', err);
-                    complete = true;
-                    if (opts.complete) opts.complete(err);
-                });
+            // Start processing (async) which will wait for load() via getIndexKeys()
+            processChangesAsync().catch(err => {
+                log('_changes error', err);
+                complete = true;
+                if (opts.complete) opts.complete(err);
             });
 
             return {
@@ -540,7 +539,6 @@ export function GoogleDriveAdapter(PouchDB: any) {
             };
         };
 
-        api.changes = api._changes;
 
         // Manual compaction trigger
         api._compact = function (callback: any): Promise<any> | void {
@@ -572,27 +570,41 @@ export function GoogleDriveAdapter(PouchDB: any) {
             callback(null, revTree);
         };
 
-        api._close = function (callback: () => void): void {
+        api._close = function (callback: any): Promise<void> | void {
             db.stopPolling();
-            nextTick(callback);
+            if (typeof callback === 'function') {
+                nextTick(callback);
+            } else {
+                return Promise.resolve();
+            }
         };
 
         api.close = api._close;
 
-        api._destroy = function (opts: any, callback: any): void {
+        api._destroy = function (opts: any, callback: any): Promise<any> | void {
             if (typeof opts === 'function') {
                 callback = opts;
                 opts = {};
             }
             db.stopPolling();
             if (opts.deleteFolder) {
-                db.deleteFolder().then(() => {
-                    callback(null, { ok: true });
+                return db.deleteFolder().then(() => {
+                    if (typeof callback === 'function') {
+                        callback(null, { ok: true });
+                    }
+                    return { ok: true };
                 }).catch((err: Error) => {
-                    callback(err);
+                    if (typeof callback === 'function') {
+                        callback(err);
+                    }
+                    throw err;
                 });
             } else {
-                nextTick(() => callback(null, { ok: true }));
+                if (typeof callback === 'function') {
+                    nextTick(() => callback(null, { ok: true }));
+                } else {
+                    return Promise.resolve({ ok: true });
+                }
             }
         };
 

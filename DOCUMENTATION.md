@@ -52,3 +52,64 @@ Compaction is a critical maintenance task that merges the `snapshot-data` with r
 ### Conflict Handling
 - **PouchDB Level**: Standard CouchDB revision conflicts (409) are preserved. A "winner" is chosen deterministically, but conflicting revisions are kept in the tree (requires `snapshot-index` to store the full revision tree, not just the winner).
 - **Adapter Level**: Drive API 409s handling (retry logic) ensures the transport layer is reliable.
+
+## 3. Testing with Local Express Server
+
+The adapter includes a built-in test mode that emulates the Google Drive API using a local Express server. This allows for full integration testing without needing real Google Cloud credentials or network calls.
+
+### Configuration
+To enable the test emulator:
+
+```typescript
+const db = new PouchDB('testdb', {
+  adapter: 'googledrive',
+  testMode: true,
+  // testServerUrl: 'http://localhost:3000' // Optional, defaults to localhost:3000
+});
+```
+
+### Test Server
+The `TestServer` class (exported in `test-src/server.ts`) provides:
+- In-memory metadata storage
+- Local file system storage for content (defaults to `.test-drive-root` directory)
+- Emulation of `files.list`, `files.get`, `files.create` (multipart), `files.update`, and `files.delete`.
+
+### Example Usage
+```typescript
+import { TestServer } from './tests-src/server';
+
+const server = new TestServer(3000);
+await server.start();
+
+// Run PouchDB operations...
+
+
+## 4. Production Testing (Real Google Drive API)
+
+To verify the adapter against the actual Google Drive service, you can run the production test suite. This requires a valid Google OAuth2 Access Token.
+
+### A. Environment Setup
+Create a `.env` file in the project root (see `.env.example`):
+```env
+GOOGLE_ACCESS_TOKEN=your_temporary_access_token_here
+```
+
+### B. Obtaining a Token via OAuth1/2 Playground
+The easiest way to get a temporary token for manual testing:
+1.  Go to the [Google OAuth2 Playground](https://developers.google.com/oauthplayground/).
+2.  **Step 1 (Select & authorize APIs)**: 
+    *   Find "Drive API v3" in the list.
+    *   Select the scope: `https://www.googleapis.com/auth/drive.file` (this is the recommended scope as it only allows the app to see files it creates).
+    *   Click **Authorize APIs** and sign in with your Google account.
+3.  **Step 2 (Exchange authorization code for tokens)**:
+    *   Click **Exchange authorization code for tokens**.
+4.  **Step 3 (Configure request to API)**:
+    *   Copy the **Access Token** string.
+    *   Paste it into your `.env` file as `GOOGLE_ACCESS_TOKEN`.
+
+### C. Running the Tests
+Execute the following command to run the tests in production mode:
+```bash
+npm run test:prod
+```
+This command sets `TEST_ENV=production`, which tells the test runner to skip the local Express emulator and use the real Google Drive endpoints with your provided token.
