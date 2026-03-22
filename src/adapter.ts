@@ -459,6 +459,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 liveListener = (changedDocs: Record<string, any>) => {
                     if (complete) return;
                     for (const id of Object.keys(changedDocs)) {
+                        if (id.startsWith('_local/')) continue;
                         const entry = db.getIndexEntry(id);
                         if (entry && entry.seq > lastSeq) {
                             const change: any = {
@@ -491,6 +492,7 @@ export function GoogleDriveAdapter(PouchDB: any) {
 
                 for (const id of keys) {
                     if (complete || processed >= limit) break;
+                    if (id.startsWith('_local/')) continue;
                     const entry = db.getIndexEntry(id);
                     if (!entry || entry.seq <= since) continue;
 
@@ -515,9 +517,9 @@ export function GoogleDriveAdapter(PouchDB: any) {
                     lastSeq = Math.max(lastSeq, entry.seq);
                 }
 
-                // ✅ CRITICAL FIX: Call opts.complete() for BOTH live and non-live modes
-                // PouchDB replication needs this callback to know when to start listening
-                if (opts.complete && !complete) {
+                // ✅ Call opts.complete() ONLY for non-live modes
+                // PouchDB replication will infinite-loop reconnect if we call complete() on a live feed
+                if (opts.complete && !complete && !opts.live) {
                     log('_changes calling complete callback with', { results_count: results.length, last_seq: lastSeq });
                     opts.complete(null, { results, last_seq: lastSeq });
                 }

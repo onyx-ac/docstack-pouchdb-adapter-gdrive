@@ -476,6 +476,9 @@ export class DriveHandler {
                 }
             }
 
+            // Notify local changes feed listeners about our own write
+            this.notifyListeners();
+
             // 5. Compaction Check
             const totalChanges = await this.countTotalChanges();
             if (totalChanges >= this.compactionThreshold ||
@@ -766,10 +769,11 @@ export class DriveHandler {
                     return;
                 }
 
-                // Compare modified times
-                this.log('Polling: comparing', metaFile.modifiedTime, 'with', this.metaModifiedTime);
-                if (metaFile.modifiedTime !== this.metaModifiedTime) {
-                    this.log('Polling detected change!', metaFile.modifiedTime);
+                // Compare etags, falling back to modifiedTime
+                this.log('Polling: comparing etag', metaFile.etag, 'with', this.metaEtag);
+                if ((metaFile.etag && this.metaEtag && metaFile.etag !== this.metaEtag) ||
+                    (!metaFile.etag && metaFile.modifiedTime !== this.metaModifiedTime)) {
+                    this.log('Polling detected change!', metaFile.etag || metaFile.modifiedTime);
                     await this.load();
                     this.notifyListeners();
                 }
@@ -790,9 +794,14 @@ export class DriveHandler {
         // Adapter needs to handle this.
         const changes: Record<string, any> = {};
         for (const [id, entry] of Object.entries(this.index)) {
-            changes[id] = { _id: id, _rev: entry.rev, _deleted: entry.deleted };
+            changes[id] = { 
+                _id: id, 
+                _rev: entry.rev, 
+                _deleted: !!entry.deleted,
+                seq: entry.seq // IMPORTANT: Missing previously, preventing filtered changes from working
+            };
         }
-        for (const l of this.listeners) l(changes);
+        for (const cb of this.listeners) cb(changes);
     }
 
     // For tests/debug

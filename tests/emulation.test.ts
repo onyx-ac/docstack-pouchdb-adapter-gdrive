@@ -67,4 +67,38 @@ describe('Google Drive Emulation Integration', () => {
             await local.close();
         }
     }, 60000);
+
+    test('should live replicate from remote to local', async () => {
+        const remoteName = 'live-remote-' + Date.now();
+        const options = {
+            ...getTestOptions(remoteName, PORT),
+            pollingIntervalMs: 1000 // Very short interval for test
+        };
+        const remote = new PouchDB(remoteName, options as any);
+        const local = new PouchDB('live-local-' + Date.now(), { adapter: 'memory' });
+
+        try {
+            // Replication from remote to local
+            const rep = remote.replicate.to(local, { live: true });
+            
+            // Wait for initial sync setup
+            await new Promise(resolve => setTimeout(resolve, 500));
+
+            // Write to remote (Google Drive instance)
+            const docId = 'live-doc-' + Date.now();
+            await remote.put({ _id: docId, title: 'Live Update from GDrive' });
+
+            // Wait for polling + replication (1s polling + some buffer)
+            // Note: In real GDrive this could take 10s+, but on TestServer it's fast.
+            await new Promise(resolve => setTimeout(resolve, 3000));
+
+            const doc = await local.get(docId);
+            expect((doc as any).title).toBe('Live Update from GDrive');
+
+            rep.cancel();
+        } finally {
+            await remote.close();
+            await local.close();
+        }
+    }, 60000);
 });
