@@ -4,5 +4,5 @@ lib
 .DS_Store
 .env
 package-lock.json
-*.txt.test-drive-root
+*.txt
 .test-drive-*

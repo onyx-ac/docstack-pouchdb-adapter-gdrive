@@ -3,9 +3,12 @@ src
 tsconfig.json
 .gitignore
 *.tsbuildinfo
-jest.config.json
+jest.config.js
 package-lock.json
 tests/
 tests-src/
 *.txt
 .env
+.test-drive-*
+*.log
+docs/
