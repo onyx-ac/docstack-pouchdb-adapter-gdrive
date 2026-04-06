@@ -183,7 +183,7 @@ export class DriveHandler {
                 // 2. Replay NEW Change Logs (Metadata only updates)
                 this.log('Replaying change logs');
                 const pendingLogs = this.meta.changeLogIds.filter(id => !this.processedLogIds.has(id));
-                
+
                 if (pendingLogs.length > 0) {
                     this.log(`Downloading ${pendingLogs.length} change logs in parallel`);
                     const logResults = await Promise.all(pendingLogs.map(async (id) => {
@@ -196,24 +196,34 @@ export class DriveHandler {
                         }
                     }));
 
+                    const foundNew: Record<string, any> = {};
                     for (const { id, changes } of logResults) {
                         if (!changes) {
                             this.log(`Skipping failed log ${id}`);
                             continue;
                         }
 
-                        let changesArray = Array.isArray(changes) ? changes : [changes];
-                        this.currentLogSizeEstimate += 100 * changesArray.length;
+                        let changesArray = Array.isArray(changes) ? (changes as ChangeEntry[]) : [changes as ChangeEntry];
+                        this.log('Processing log file', id, 'changes', changesArray.length);
 
                         for (const change of changesArray) {
-                            this.log('Processing change, sequence', change.seq);
                             this.updateIndex(change, id);
                             if (this.docCache.get(change.id)) {
                                 this.docCache.remove(change.id);
                             }
+                            foundNew[change.id] = {
+                                _id: change.id,
+                                _rev: change.rev,
+                                _deleted: !!change.deleted,
+                                seq: change.seq
+                            };
                         }
                         this.processedLogIds.add(id);
-                        this.log('Processed log', id);
+                    }
+
+                    if (Object.keys(foundNew).length > 0) {
+                        this.log('Load complete, notifying of changes', Object.keys(foundNew).length);
+                        this.notifyListeners(foundNew);
                     }
                 }
 
@@ -522,7 +532,7 @@ export class DriveHandler {
                 // 1. Download current local docs (no cache)
                 let store: SnapshotDataChunk = { docs: {} };
                 let currentEtag: string | null = null;
-                
+
                 if (this.meta.localDocsId) {
                     try {
                         const fileMeta = await this.client.getFileMetadata(this.meta.localDocsId);
@@ -552,14 +562,22 @@ export class DriveHandler {
                     // Update Meta with new File ID
                     await this.atomicUpdateMeta((latest) => ({ ...latest, localDocsId: res.id }));
                 }
-                
+
                 this.localDocsEtag = res.etag;
                 // Update Index
+                const changedDocs: Record<string, any> = {};
                 for (const change of changes) {
-                   this.updateIndex(change, res.id);
-                   if (change.doc) this.docCache.put(change.id, change.doc);
-                   else this.docCache.remove(change.id);
+                    this.updateIndex(change, res.id);
+                    if (change.doc) this.docCache.put(change.id, change.doc);
+                    else this.docCache.remove(change.id);
+                    changedDocs[change.id] = {
+                        _id: change.id,
+                        _rev: change.rev,
+                        _deleted: !!change.deleted,
+                        seq: change.seq
+                    };
                 }
+                this.notifyListeners(changedDocs);
                 return;
             } catch (err: any) {
                 if (err.status === 412 || err.status === 409) {
@@ -588,6 +606,7 @@ export class DriveHandler {
             // 4. Update Local State
             this.meta = nextMeta;
 
+            const changedDocs: Record<string, any> = {};
             for (const change of changes) {
                 this.updateIndex(change, fileId);
                 if (change.doc) {
@@ -595,10 +614,16 @@ export class DriveHandler {
                 } else if (change.deleted) {
                     this.docCache.remove(change.id);
                 }
+                changedDocs[change.id] = {
+                    _id: change.id,
+                    _rev: change.rev,
+                    _deleted: !!change.deleted,
+                    seq: change.seq
+                };
             }
 
-            // Notify local changes feed listeners about our own write
-            this.notifyListeners();
+            // Notify local changes feed listeners about only what we just wrote
+            this.notifyListeners(changedDocs);
 
             // 5. Compaction Check
             const totalChanges = await this.countTotalChanges();
@@ -648,85 +673,85 @@ export class DriveHandler {
         try {
             this.log('Starting compaction');
             const snapshotSeq = this.meta.seq;
-        const oldLogIds = [...this.meta.changeLogIds];
-        const oldIndexId = this.meta.snapshotIndexId;
+            const oldLogIds = [...this.meta.changeLogIds];
+            const oldIndexId = this.meta.snapshotIndexId;
 
-        // 1. Fetch ALL active documents
-        // We need them to build the new large snapshot-data file
-        // This is the one time we download everything if not cached. 
-        // Optimization: We could reuse existing `snapshot-data` chunks and only append new data 
-        // to a new chunk, but for simplicity: Merge All.
+            // 1. Fetch ALL active documents
+            // We need them to build the new large snapshot-data file
+            // This is the one time we download everything if not cached. 
+            // Optimization: We could reuse existing `snapshot-data` chunks and only append new data 
+            // to a new chunk, but for simplicity: Merge All.
 
-        const allIds = Object.keys(this.index).filter(id => !this.index[id].deleted && !id.startsWith('_local/'));
-        const allDocs = await this.getMulti(allIds);
+            const allIds = Object.keys(this.index).filter(id => !this.index[id].deleted && !id.startsWith('_local/'));
+            const allDocs = await this.getMulti(allIds);
 
-        const snapshotData: SnapshotDataChunk = { docs: {} };
-        const missingDocs: string[] = [];
-        allIds.forEach((id, i) => {
-            if (allDocs[i]) {
-                snapshotData.docs[id] = allDocs[i];
-            } else {
-                missingDocs.push(id);
+            const snapshotData: SnapshotDataChunk = { docs: {} };
+            const missingDocs: string[] = [];
+            allIds.forEach((id, i) => {
+                if (allDocs[i]) {
+                    snapshotData.docs[id] = allDocs[i];
+                } else {
+                    missingDocs.push(id);
+                }
+            });
+
+            if (missingDocs.length > 0) {
+                this.log('Compaction ABORTED: Failed to fetch documents', missingDocs);
+                throw new Error(`Compaction failed: missing ${missingDocs.length} documents. Aborting to prevent data loss.`);
             }
-        });
 
-        if (missingDocs.length > 0) {
-            this.log('Compaction ABORTED: Failed to fetch documents', missingDocs);
-            throw new Error(`Compaction failed: missing ${missingDocs.length} documents. Aborting to prevent data loss.`);
-        }
+            // 2. Upload Data File
+            const dataContent = JSON.stringify(snapshotData);
+            const dataRes = await this.client.createFile(
+                `snapshot-data-${Date.now()}.json`,
+                [this.folderId!],
+                'application/json',
+                dataContent
+            );
+            const dataFileId = dataRes.id;
 
-        // 2. Upload Data File
-        const dataContent = JSON.stringify(snapshotData);
-        const dataRes = await this.client.createFile(
-            `snapshot-data-${Date.now()}.json`,
-            [this.folderId!],
-            'application/json',
-            dataContent
-        );
-        const dataFileId = dataRes.id;
+            // 3. Create Index pointing to this Data File
+            const newIndexEntries: Record<string, IndexEntry> = {};
+            for (const id of Object.keys(snapshotData.docs)) {
+                newIndexEntries[id] = {
+                    rev: this.index[id].rev,
+                    seq: this.index[id].seq,
+                    location: { fileId: dataFileId }
+                };
+            }
 
-        // 3. Create Index pointing to this Data File
-        const newIndexEntries: Record<string, IndexEntry> = {};
-        for (const id of Object.keys(snapshotData.docs)) {
-            newIndexEntries[id] = {
-                rev: this.index[id].rev,
-                seq: this.index[id].seq,
-                location: { fileId: dataFileId }
+            const snapshotIndex: SnapshotIndex = {
+                entries: newIndexEntries,
+                seq: snapshotSeq,
+                createdAt: Date.now()
             };
-        }
 
-        const snapshotIndex: SnapshotIndex = {
-            entries: newIndexEntries,
-            seq: snapshotSeq,
-            createdAt: Date.now()
-        };
+            const indexContent = JSON.stringify(snapshotIndex);
+            const indexRes = await this.client.createFile(
+                `snapshot-index-${Date.now()}.json`,
+                [this.folderId!],
+                'application/json',
+                indexContent
+            );
+            const newIndexId = indexRes.id;
 
-        const indexContent = JSON.stringify(snapshotIndex);
-        const indexRes = await this.client.createFile(
-            `snapshot-index-${Date.now()}.json`,
-            [this.folderId!],
-            'application/json',
-            indexContent
-        );
-        const newIndexId = indexRes.id;
+            // 4. Update Meta
+            let filesToDelete: string[] = [];
+            await this.atomicUpdateMeta((latest) => {
+                const remainingLogs = latest.changeLogIds.filter(id => !oldLogIds.includes(id));
+                // Only delete files that were in oldLogIds but not in remainingLogs
+                filesToDelete = oldLogIds.filter(id => !remainingLogs.includes(id));
+                return {
+                    ...latest,
+                    snapshotIndexId: newIndexId,
+                    changeLogIds: remainingLogs,
+                    lastCompaction: Date.now()
+                };
+            });
 
-        // 4. Update Meta
-        let filesToDelete: string[] = [];
-        await this.atomicUpdateMeta((latest) => {
-            const remainingLogs = latest.changeLogIds.filter(id => !oldLogIds.includes(id));
-            // Only delete files that were in oldLogIds but not in remainingLogs
-            filesToDelete = oldLogIds.filter(id => !remainingLogs.includes(id));
-            return {
-                ...latest,
-                snapshotIndexId: newIndexId,
-                changeLogIds: remainingLogs,
-                lastCompaction: Date.now()
-            };
-        });
-
-        // 5. Cleanup - Only delete files that were confirmed removed from metadata
-        await this.cleanupOldFiles(oldIndexId, filesToDelete);
-        this.currentLogSizeEstimate = 0;
+            // 5. Cleanup - Only delete files that were confirmed removed from metadata
+            await this.cleanupOldFiles(oldIndexId, filesToDelete);
+            this.currentLogSizeEstimate = 0;
         } finally {
             this.isCompacting = false;
         }
@@ -774,42 +799,26 @@ export class DriveHandler {
     }
 
     private async findFile(name: string): Promise<FilePointer | null> {
-        const pending = this.pendingFinds.get(name);
-        if (pending) {
-            this.log('findFile reuse pending search', name);
-            return await pending;
-        }
-
-        const findPromise = (async () => {
-            const safeName = this.escapeQuery(name);
-            const q = `name = '${safeName}' and '${this.folderId}' in parents and trashed = false`;
-            try {
-                const files = await this.client.listFiles(q);
-                if (files.length > 0) {
-                    let file = files[0];
-                    if (!file.etag) {
-                        // Robustness: Fetch metadata for the file if etag is missing from list
-                        try {
-                            file = await this.client.getFileMetadata(file.id);
-                        } catch (e) {
-                            this.log('Failed to fetch file metadata for etag', file.id, e);
-                        }
-                    }
-                    return {
-                        fileId: file.id,
-                        etag: file.etag,
-                        md5Checksum: (file as any).md5Checksum,
-                        modifiedTime: file.modifiedTime
-                    } as FilePointer;
+        const safeName = this.escapeQuery(name);
+        const q = `name = '${safeName}' and '${this.folderId}' in parents and trashed = false`;
+        const files = await this.client.listFiles(q);
+        if (files.length > 0) {
+            let file = files[0];
+            if (!file.etag) {
+                try {
+                    file = await this.client.getFileMetadata(file.id);
+                } catch (e) {
+                    this.log('Failed to fetch file metadata for etag', file.id, e);
                 }
-                return null;
-            } finally {
-                this.pendingFinds.delete(name);
             }
-        })();
-
-        this.pendingFinds.set(name, findPromise);
-        return await findPromise;
+            return {
+                fileId: file.id,
+                etag: file.etag,
+                md5Checksum: (file as any).md5Checksum,
+                modifiedTime: file.modifiedTime
+            } as FilePointer;
+        }
+        return null;
     }
 
     private async downloadJson(fileId: string, skipCache: boolean = false): Promise<any> {
@@ -923,7 +932,7 @@ export class DriveHandler {
                 const remoteModified = metaFile.modifiedTime;
 
                 this.log('Polling: comparing etag', remoteEtag, 'with', this.metaEtag, 'md5', remoteMd5, 'with', this.metaMd5);
-                
+
                 let changed = false;
                 if (remoteEtag && this.metaEtag) {
                     if (remoteEtag !== this.metaEtag) changed = true;
@@ -946,23 +955,20 @@ export class DriveHandler {
         }, intervalMs);
     }
 
-    private notifyListeners() {
-        // Observers expecting 'docs' object might be broken if they expect FULL body.
-        // We can pass empty object or partials?
-        // Real PouchDB changes feed calls `db.changes()`. 
-        // Our `adapter.js` uses `db.onChange` effectively.
-        // We should pass a map of { ID: { _rev, ... } } (Index entries)
-        // Adapter needs to handle this.
-        const changes: Record<string, any> = {};
-        for (const [id, entry] of Object.entries(this.index)) {
-            changes[id] = { 
-                _id: id, 
-                _rev: entry.rev, 
-                _deleted: !!entry.deleted,
-                seq: entry.seq // IMPORTANT: Missing previously, preventing filtered changes from working
-            };
+    private notifyListeners(changedDocs?: Record<string, any>) {
+        const changes: Record<string, any> = changedDocs || {};
+        
+        // If no specifically changed docs provided, we don't want to firehose the whole index anymore
+        // as it causes reprocessing loops in PouchDB sync.
+        if (Object.keys(changes).length === 0) return;
+
+        for (const cb of this.listeners) {
+            try {
+                cb(changes);
+            } catch (e) {
+                this.log('Error in change listener callback', e);
+            }
         }
-        for (const cb of this.listeners) cb(changes);
     }
 
     // For tests/debug
