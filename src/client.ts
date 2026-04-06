@@ -89,7 +89,7 @@ export class GoogleDriveClient {
     async listFiles(q: string): Promise<DriveFile[]> {
         const params = new URLSearchParams({
             q,
-            fields: 'files(id,name,mimeType,parents,modifiedTime)'
+            fields: 'files(id,name,mimeType,parents,modifiedTime,md5Checksum)'
         });
         // FIX: URLSearchParams uses '+', but Drive API is safer with '%20'
         const queryString = params.toString().replace(/\+/g, '%20');
@@ -124,7 +124,7 @@ export class GoogleDriveClient {
 
     // Single metadata get (for etag check)
     async getFileMetadata(fileId: string): Promise<DriveFile> {
-        const params = new URLSearchParams({ fields: 'id,name,mimeType,parents,modifiedTime' });
+        const params = new URLSearchParams({ fields: 'id,name,mimeType,parents,modifiedTime,md5Checksum' });
         const queryString = params.toString().replace(/\+/g, '%20');
         const res = await this.fetch(`${this.baseUrl}/${fileId}?${queryString}`, { method: 'GET' });
         const data = await res.json();

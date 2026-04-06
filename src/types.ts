@@ -98,6 +98,8 @@ export interface MetaData {
     lastCompaction: number | null;
     /** Database name */
     dbName: string;
+    /** File ID for _local documents store (optimizes by avoiding app-log writes) */
+    localDocsId?: string | null;
     /** Schema Version (for migration) */
     version?: number;
 }

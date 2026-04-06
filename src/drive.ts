@@ -44,7 +44,9 @@ export class DriveHandler {
     };
 
     private metaEtag: string | null = null;
+    private metaMd5: string | null = null;
     private metaModifiedTime: string | null = null;
+    private localDocsEtag: string | null = null;
 
     // In-Memory Index: ID -> Metadata/Pointer
     private index: Record<string, IndexEntry> = {};
@@ -135,6 +137,7 @@ export class DriveHandler {
                     this.log('Retrieved meta file', { fileId: metaFile.id });
                     this.meta = await this.downloadJson(metaFile.id, true); // No cache for meta
                     this.metaEtag = metaFile.etag || null;
+                    this.metaMd5 = (metaFile as any).md5Checksum || null;
                     this.metaModifiedTime = metaFile.modifiedTime || null;
                 } else {
                     this.log('Meta file not found, creating new');
@@ -177,36 +180,69 @@ export class DriveHandler {
 
                 // 2. Replay NEW Change Logs (Metadata only updates)
                 this.log('Replaying change logs');
-                for (const logId of this.meta.changeLogIds) {
-                    if (this.processedLogIds.has(logId)) continue;
-                    this.log('Replaying change log', logId);
-                    let changes = await this.downloadNdjson(logId);
-                    if (!Array.isArray(changes)) {
-                        this.log("Unexpected changes", { changes, logId });
-                        this.log('Downloaded changes not an array, wrapping/ignoring', typeof changes);
-                        changes = changes ? [changes] : []; // Fallback
-                    }
-                    this.currentLogSizeEstimate += 100 * changes.length;
-                    this.log('Replayed change log', logId);
-
-                    for (const change of changes) {
-                        this.log('Processing change, sequence', change.seq);
-                        this.updateIndex(change, logId);
-                        if (this.docCache.get(change.id)) {
-                            this.docCache.remove(change.id);
+                const pendingLogs = this.meta.changeLogIds.filter(id => !this.processedLogIds.has(id));
+                
+                if (pendingLogs.length > 0) {
+                    this.log(`Downloading ${pendingLogs.length} change logs in parallel`);
+                    const logResults = await Promise.all(pendingLogs.map(async (id) => {
+                        try {
+                            const changes = await this.downloadNdjson(id);
+                            return { id, changes };
+                        } catch (e) {
+                            this.log(`Failed to download change log ${id}`, e);
+                            return { id, changes: null };
                         }
+                    }));
+
+                    for (const { id, changes } of logResults) {
+                        if (!changes) {
+                            this.log(`Skipping failed log ${id}`);
+                            continue;
+                        }
+
+                        let changesArray = Array.isArray(changes) ? changes : [changes];
+                        this.currentLogSizeEstimate += 100 * changesArray.length;
+
+                        for (const change of changesArray) {
+                            this.log('Processing change, sequence', change.seq);
+                            this.updateIndex(change, id);
+                            if (this.docCache.get(change.id)) {
+                                this.docCache.remove(change.id);
+                            }
+                        }
+                        this.processedLogIds.add(id);
+                        this.log('Processed log', id);
                     }
-                    this.processedLogIds.add(logId);
-                    this.log('Processed log', logId)
                 }
 
-                // 3. Start Polling (if enabled)
-                if (this.options.pollingIntervalMs) {
-                    this.log('Starting polling with interval', this.options.pollingIntervalMs);
-                    this.startPolling(Number(this.options.pollingIntervalMs));
-                } else {
-                    this.log('Polling disabled (no interval provided)');
+                // 2. Replay NEW Change Logs (Metadata only updates)
+                // ... (previous logic for change logs)
+                // (Already updated in previous turn, keep it)
+
+                // 2b. Load Local Documents Store (Pinned in meta)
+                if (this.meta.localDocsId) {
+                    this.log('Loading local docs store', this.meta.localDocsId);
+                    try {
+                        const localStore = await this.client.getFileMetadata(this.meta.localDocsId);
+                        this.localDocsEtag = localStore.etag || null;
+                        const localDocsChunk: SnapshotDataChunk = await this.downloadJson(this.meta.localDocsId, true);
+                        if (localDocsChunk && localDocsChunk.docs) {
+                            for (const [id, doc] of Object.entries(localDocsChunk.docs)) {
+                                this.log('Merging local doc', id);
+                                this.index[id] = {
+                                    rev: doc._rev,
+                                    seq: 0, // Local docs don't participate in shared sequences
+                                    location: { fileId: this.meta.localDocsId }
+                                };
+                                this.docCache.put(id, doc);
+                            }
+                        }
+                    } catch (e) {
+                        this.log('Failed to load local docs store', e);
+                    }
                 }
+
+                // 3. Start Polling ...
             } catch (e) {
                 console.error('Failed to load database', e);
                 throw e;
@@ -423,25 +459,36 @@ export class DriveHandler {
     /** Append changes with OCC */
     async appendChanges(changes: ChangeEntry[]): Promise<void> {
         const MAX_RETRIES = 5;
-        let attempt = 0;
+        let attemptNum = 0;
 
-        while (attempt < MAX_RETRIES) {
+        const local = changes.filter(c => c.id.startsWith('_local/'));
+        const remote = changes.filter(c => !c.id.startsWith('_local/'));
+
+        // Handle Local Docs (Pinned Store)
+        if (local.length > 0) {
+            await this.appendLocalDocs(local);
+        }
+
+        // Handle Remote Docs (App Log)
+        if (remote.length === 0) return;
+
+        while (attemptNum < MAX_RETRIES) {
             try {
-                return await this.tryAppendChanges(changes);
+                return await this.tryAppendChanges(remote);
             } catch (err: any) {
                 if (err.status === 412 || err.status === 409) {
                     // Reload and RETRY
                     await this.load();
                     // Check conflicts against Index (Metadata sufficient)
-                    this.checkConflicts(changes);
+                    this.checkConflicts(remote);
 
                     // Reseq
                     let currentSeq = this.meta.seq;
-                    for (const change of changes) {
+                    for (const change of remote) {
                         currentSeq++;
                         change.seq = currentSeq;
                     }
-                    attempt++;
+                    attemptNum++;
                     await new Promise(r => setTimeout(r, Math.random() * 500 + 100));
                     continue;
                 }
@@ -449,6 +496,64 @@ export class DriveHandler {
             }
         }
         throw new Error('Failed to append changes');
+    }
+
+    private async appendLocalDocs(changes: ChangeEntry[]): Promise<void> {
+        const MAX_RETRIES = 5;
+        let attempt = 0;
+        while (attempt < MAX_RETRIES) {
+            try {
+                // 1. Download current local docs (no cache)
+                let store: SnapshotDataChunk = { docs: {} };
+                let currentEtag: string | null = null;
+                
+                if (this.meta.localDocsId) {
+                    try {
+                        const fileMeta = await this.client.getFileMetadata(this.meta.localDocsId);
+                        currentEtag = fileMeta.etag || null;
+                        store = await this.downloadJson(this.meta.localDocsId, true);
+                    } catch (e: any) {
+                        if (e.status !== 404) throw e;
+                    }
+                }
+
+                // 2. Merge changes
+                for (const change of changes) {
+                    if (change.deleted) {
+                        delete store.docs[change.id];
+                    } else if (change.doc) {
+                        store.docs[change.id] = change.doc;
+                    }
+                }
+
+                // 3. Save back
+                const content = JSON.stringify(store);
+                let res: { id: string, etag: string };
+                if (this.meta.localDocsId) {
+                    res = await this.client.updateFile(this.meta.localDocsId, content, currentEtag || undefined);
+                } else {
+                    res = await this.client.createFile('_local_docs.json', [this.folderId!], 'application/json', content);
+                    // Update Meta with new File ID
+                    await this.atomicUpdateMeta((latest) => ({ ...latest, localDocsId: res.id }));
+                }
+                
+                this.localDocsEtag = res.etag;
+                // Update Index
+                for (const change of changes) {
+                   this.updateIndex(change, res.id);
+                   if (change.doc) this.docCache.put(change.id, change.doc);
+                   else this.docCache.remove(change.id);
+                }
+                return;
+            } catch (err: any) {
+                if (err.status === 412 || err.status === 409) {
+                    attempt++;
+                    await new Promise(r => setTimeout(r, Math.random() * 500 + 100));
+                    continue;
+                }
+                throw err;
+            }
+        }
     }
 
     private async tryAppendChanges(changes: ChangeEntry[]): Promise<void> {
@@ -536,13 +641,23 @@ export class DriveHandler {
         // Optimization: We could reuse existing `snapshot-data` chunks and only append new data 
         // to a new chunk, but for simplicity: Merge All.
 
-        const allIds = Object.keys(this.index).filter(id => !this.index[id].deleted);
+        const allIds = Object.keys(this.index).filter(id => !this.index[id].deleted && !id.startsWith('_local/'));
         const allDocs = await this.getMulti(allIds);
 
         const snapshotData: SnapshotDataChunk = { docs: {} };
+        const missingDocs: string[] = [];
         allIds.forEach((id, i) => {
-            if (allDocs[i]) snapshotData.docs[id] = allDocs[i];
+            if (allDocs[i]) {
+                snapshotData.docs[id] = allDocs[i];
+            } else {
+                missingDocs.push(id);
+            }
         });
+
+        if (missingDocs.length > 0) {
+            this.log('Compaction ABORTED: Failed to fetch documents', missingDocs);
+            throw new Error(`Compaction failed: missing ${missingDocs.length} documents. Aborting to prevent data loss.`);
+        }
 
         // 2. Upload Data File
         const dataContent = JSON.stringify(snapshotData);
@@ -701,11 +816,13 @@ export class DriveHandler {
         if (metaFile) {
             const res = await this.client.updateFile(metaFile.id, content, expectedEtag || undefined);
             this.metaEtag = res.etag;
+            this.metaMd5 = (res as any).md5Checksum || null;
             this.metaModifiedTime = res.modifiedTime;
             this.fileCache.remove(metaFile.id); // Invalidate cache
         } else {
             const res = await this.client.createFile('_meta.json', [this.folderId!], 'application/json', content);
             this.metaEtag = res.etag;
+            this.metaMd5 = (res as any).md5Checksum || null;
             this.metaModifiedTime = res.modifiedTime;
         }
     }
@@ -769,11 +886,24 @@ export class DriveHandler {
                     return;
                 }
 
-                // Compare etags, falling back to modifiedTime
-                this.log('Polling: comparing etag', metaFile.etag, 'with', this.metaEtag);
-                if ((metaFile.etag && this.metaEtag && metaFile.etag !== this.metaEtag) ||
-                    (!metaFile.etag && metaFile.modifiedTime !== this.metaModifiedTime)) {
-                    this.log('Polling detected change!', metaFile.etag || metaFile.modifiedTime);
+                // Compare etags, falling back to md5Checksum or modifiedTime
+                const remoteEtag = metaFile.etag;
+                const remoteMd5 = (metaFile as any).md5Checksum;
+                const remoteModified = metaFile.modifiedTime;
+
+                this.log('Polling: comparing etag', remoteEtag, 'with', this.metaEtag, 'md5', remoteMd5, 'with', this.metaMd5);
+                
+                let changed = false;
+                if (remoteEtag && this.metaEtag) {
+                    if (remoteEtag !== this.metaEtag) changed = true;
+                } else if (remoteMd5 && this.metaMd5) {
+                    if (remoteMd5 !== this.metaMd5) changed = true;
+                } else if (remoteModified !== this.metaModifiedTime) {
+                    changed = true;
+                }
+
+                if (changed) {
+                    this.log('Polling detected change!', remoteEtag || remoteMd5 || remoteModified);
                     await this.load();
                     this.notifyListeners();
                 }
