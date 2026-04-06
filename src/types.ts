@@ -46,6 +46,9 @@ export interface ChangeEntry {
 /** Location pointer for lazy loading */
 export interface FilePointer {
     fileId: string;
+    etag?: string;
+    md5Checksum?: string;
+    modifiedTime?: string;
     /** Optional offset/length for future optimization (packed files) */
     offset?: number;
     length?: number;

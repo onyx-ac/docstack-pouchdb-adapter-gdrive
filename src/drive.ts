@@ -66,6 +66,8 @@ export class DriveHandler {
     private currentSnapshotIndexId: string | null = null;
     private debug: boolean = false;
     private isCompacting: boolean = false;
+    private pendingDownloads: Map<string, Promise<any>> = new Map();
+    private pendingFinds: Map<string, Promise<any>> = new Map();
 
     private log(...args: any[]) {
         console.log(`[googledrive-drive] [${this.meta.dbName}]`, ...args);
@@ -134,10 +136,10 @@ export class DriveHandler {
 
                 const metaFile = await this.findFile('_meta.json');
                 if (metaFile) {
-                    this.log('Retrieved meta file', { fileId: metaFile.id });
-                    this.meta = await this.downloadJson(metaFile.id, true); // No cache for meta
+                    this.log('Retrieved meta file', { fileId: metaFile.fileId });
+                    this.meta = await this.downloadJson(metaFile.fileId, true); // No cache for meta
                     this.metaEtag = metaFile.etag || null;
-                    this.metaMd5 = (metaFile as any).md5Checksum || null;
+                    this.metaMd5 = metaFile.md5Checksum || null;
                     this.metaModifiedTime = metaFile.modifiedTime || null;
                 } else {
                     this.log('Meta file not found, creating new');
@@ -333,42 +335,56 @@ export class DriveHandler {
             }
         }
 
-        this.log('fetchFile downloading', fileId);
-        const data = await this.client.getFile(fileId);
-        let parsed: any;
+        // Always check pending downloads. A download in progress is as fresh as it 
+        // can be right now, so we can reuse it even if skipCache is true.
+        const pending = this.pendingDownloads.get(fileId);
+        if (pending) {
+            this.log('fetchFile reuse pending download', fileId);
+            return await pending;
+        }
 
-        if (typeof data === 'string') {
-            const trimmed = data.trim();
-            if (trimmed.startsWith('{')) {
-                // Could be JSON or NDJSON
-                if (trimmed.includes('\n')) {
-                    // Definitely NDJSON (multiple lines)
-                    try {
-                        const lines = trimmed.split('\n').filter(l => l);
-                        parsed = lines.map(line => JSON.parse(line));
-                    } catch (e) {
+        const downloadPromise = (async () => {
+            try {
+                this.log('fetchFile downloading', fileId);
+                const data = await this.client.getFile(fileId);
+                let parsed: any;
+
+                if (typeof data === 'string') {
+                    const trimmed = data.trim();
+                    if (trimmed.startsWith('{')) {
+                        // Could be JSON or NDJSON
+                        if (trimmed.includes('\n')) {
+                            // Definitely NDJSON (multiple lines)
+                            try {
+                                const lines = trimmed.split('\n').filter(l => l);
+                                parsed = lines.map(line => JSON.parse(line));
+                            } catch (e) {
+                                parsed = data;
+                            }
+                        } else {
+                            // Single line. Try regular JSON first.
+                            try {
+                                parsed = JSON.parse(trimmed);
+                            } catch (e) {
+                                parsed = data;
+                            }
+                        }
+                    } else {
                         parsed = data;
                     }
                 } else {
-                    // Single line. Try regular JSON first.
-                    try {
-                        parsed = JSON.parse(trimmed);
-                        // Optional: if we know it was supposed to be NDJSON? 
-                        // Our change files are always NDJSON. 
-                        // But _meta.json and snapshot-*.json are regular JSON.
-                    } catch (e) {
-                        parsed = data;
-                    }
+                    parsed = data;
                 }
-            } else {
-                parsed = data;
-            }
-        } else {
-            parsed = data;
-        }
 
-        this.fileCache.put(fileId, parsed);
-        return parsed;
+                if (!skipCache) this.fileCache.put(fileId, parsed);
+                return parsed;
+            } finally {
+                if (!skipCache) this.pendingDownloads.delete(fileId);
+            }
+        })();
+
+        if (!skipCache) this.pendingDownloads.set(fileId, downloadPromise);
+        return await downloadPromise;
     }
 
     /** Get multiple docs (Atomic-ish) used for _allDocs */
@@ -725,7 +741,7 @@ export class DriveHandler {
             try {
                 const metaFile = await this.findFile('_meta.json');
                 if (!metaFile) throw new Error('Meta missing');
-                const validMeta = await this.downloadJson(metaFile.id, true); // No cache
+                const validMeta = await this.downloadJson(metaFile.fileId, true); // No cache
                 const newMeta = modifier(validMeta);
                 await this.saveMeta(newMeta, metaFile.etag);
                 this.meta = newMeta;
@@ -757,28 +773,43 @@ export class DriveHandler {
         return createRes.id;
     }
 
-    private async findFile(name: string): Promise<{ id: string, etag: string, modifiedTime: string } | null> {
-        if (!this.folderId) return null;
-        const safeName = this.escapeQuery(name);
-        const q = `name = '${safeName}' and '${this.folderId}' in parents and trashed = false`;
-        const files = await this.client.listFiles(q);
-        if (files.length > 0) {
-            let file = files[0];
-            if (!file.etag) {
-                // Robustness: Fetch metadata for the file if etag is missing from list
-                try {
-                    file = await this.client.getFileMetadata(file.id);
-                } catch (e) {
-                    this.log('Failed to fetch file metadata for etag', file.id, e);
-                }
-            }
-            return {
-                id: file.id,
-                etag: file.etag,
-                modifiedTime: file.modifiedTime
-            } as any;
+    private async findFile(name: string): Promise<FilePointer | null> {
+        const pending = this.pendingFinds.get(name);
+        if (pending) {
+            this.log('findFile reuse pending search', name);
+            return await pending;
         }
-        return null;
+
+        const findPromise = (async () => {
+            const safeName = this.escapeQuery(name);
+            const q = `name = '${safeName}' and '${this.folderId}' in parents and trashed = false`;
+            try {
+                const files = await this.client.listFiles(q);
+                if (files.length > 0) {
+                    let file = files[0];
+                    if (!file.etag) {
+                        // Robustness: Fetch metadata for the file if etag is missing from list
+                        try {
+                            file = await this.client.getFileMetadata(file.id);
+                        } catch (e) {
+                            this.log('Failed to fetch file metadata for etag', file.id, e);
+                        }
+                    }
+                    return {
+                        fileId: file.id,
+                        etag: file.etag,
+                        md5Checksum: (file as any).md5Checksum,
+                        modifiedTime: file.modifiedTime
+                    } as FilePointer;
+                }
+                return null;
+            } finally {
+                this.pendingFinds.delete(name);
+            }
+        })();
+
+        this.pendingFinds.set(name, findPromise);
+        return await findPromise;
     }
 
     private async downloadJson(fileId: string, skipCache: boolean = false): Promise<any> {
@@ -814,11 +845,11 @@ export class DriveHandler {
         const metaFile = await this.findFile('_meta.json');
 
         if (metaFile) {
-            const res = await this.client.updateFile(metaFile.id, content, expectedEtag || undefined);
+            const res = await this.client.updateFile(metaFile.fileId, content, expectedEtag || undefined);
             this.metaEtag = res.etag;
             this.metaMd5 = (res as any).md5Checksum || null;
             this.metaModifiedTime = res.modifiedTime;
-            this.fileCache.remove(metaFile.id); // Invalidate cache
+            this.fileCache.remove(metaFile.fileId); // Invalidate cache
         } else {
             const res = await this.client.createFile('_meta.json', [this.folderId!], 'application/json', content);
             this.metaEtag = res.etag;
@@ -888,7 +919,7 @@ export class DriveHandler {
 
                 // Compare etags, falling back to md5Checksum or modifiedTime
                 const remoteEtag = metaFile.etag;
-                const remoteMd5 = (metaFile as any).md5Checksum;
+                const remoteMd5 = metaFile.md5Checksum;
                 const remoteModified = metaFile.modifiedTime;
 
                 this.log('Polling: comparing etag', remoteEtag, 'with', this.metaEtag, 'md5', remoteMd5, 'with', this.metaMd5);

@@ -400,16 +400,28 @@ export function GoogleDriveAdapter(PouchDB: any) {
                     results.push({ ok: true, id, rev: newRev });
                 } else {
                     let newRev: string;
+                    let savedDoc: any;
 
                     if (newEdits) {
                         const oldRev = entry?.rev || '0-0';
                         const revNum = parseInt(oldRev.split('-')[0], 10) + 1;
-                        newRev = revNum + '-' + generateRevId();
+                        const revHash = generateRevId();
+                        newRev = revNum + '-' + revHash;
+
+                        savedDoc = Object.assign({}, doc, { _rev: newRev });
+                        if (doc._revisions) {
+                            savedDoc._revisions = {
+                                start: revNum,
+                                ids: [revHash, ...(doc._revisions.ids || [])]
+                            };
+                            if (savedDoc._revisions.ids.length > 500) {
+                                savedDoc._revisions.ids = savedDoc._revisions.ids.slice(0, 500);
+                            }
+                        }
                     } else {
                         newRev = doc._rev;
+                        savedDoc = Object.assign({}, doc, { _rev: newRev });
                     }
-
-                    const savedDoc = Object.assign({}, doc, { _rev: newRev });
 
                     changes.push({
                         seq,
@@ -618,8 +630,17 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 opts = {};
             }
             const id = doc._id;
-            const rev = '0-1';
+            const revNum = 1;
+            const revHash = generateRevId();
+            const rev = revNum + '-' + revHash;
+
             const savedDoc = Object.assign({}, doc, { _rev: rev });
+            if (doc._revisions) {
+                savedDoc._revisions = {
+                    start: revNum,
+                    ids: [revHash, ...(doc._revisions.ids || [])]
+                };
+            }
 
             const change: ChangeEntry = {
                 seq: db.getNextSeq(),
