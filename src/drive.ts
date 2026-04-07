@@ -328,6 +328,12 @@ export class DriveHandler {
         }
 
         if (doc) {
+            // HEAL: Ensure PouchDB core validation doesn't fail due to history corruption
+            // This prevents the infinite replicator retry loop when start < ids.length
+            if (doc._revisions && doc._revisions.start < doc._revisions.ids.length) {
+                 const start = doc._revisions.start || 1;
+                 doc._revisions.ids = doc._revisions.ids.slice(0, start);
+            }
             this.docCache.put(id, doc);
             doc._rev = entry.rev;
         }
