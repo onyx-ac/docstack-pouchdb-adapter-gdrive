@@ -3,21 +3,30 @@
  * ===================================
  * Development tool (packaged as a Jest test, same as tests/production.explore.test.ts),
  * not a narrow pass/fail unit test. It verifies that PouchDB's standard replication
- * protocol works correctly THROUGH a real Google Drive-backed database, in both
- * directions:
+ * protocol works correctly THROUGH a real Google Drive-backed database, with BOTH
+ * sides actually writing - the real-world shape of two devices syncing through a
+ * shared Drive folder, not just a one-way mirror:
  *
  *   classical (memory) instance A --replicate--> Google Drive instance B
  *   Google Drive instance B       --replicate--> classical (memory) instance C
+ *   ... C makes its own writes: updates to docs that originated on A, plus brand
+ *       new docs that never existed on A ...
+ *   classical (memory) instance C --replicate--> Google Drive instance B
+ *   Google Drive instance B       --replicate--> classical (memory) instance A
  *
- * i.e. Google Drive acting as the replication hub between two ordinary PouchDB
- * instances, which is the adapter's actual intended use case (sync a local PouchDB
- * to Drive, then pull it down on another device/instance).
+ * A plain C -> A leg (with C being a pure, untouched mirror of A) would be a no-op and
+ * wouldn't prove bidirectional sync works - the point of this test is that C's *own*
+ * edits and new documents survive being pushed back into the Drive hub and pulled back
+ * down to the origin, with correct revisions and without corrupting the data A never
+ * touched.
  *
  * It writes documents and a couple of updates (second revisions) on A, replicates
  * A -> B, deep-compares every document (including revision IDs, not just content) on
- * B against A, then replicates B -> C and deep-compares C against A/B the same way.
- * A structural mismatch at either hop - missing docs, extra docs, wrong revision,
- * wrong content - is treated as a failure.
+ * B against A, replicates B -> C and compares the same way, has C update two of the
+ * A-originated docs and create two brand new ones, pushes that into B, then pulls the
+ * merged state back down to A and confirms: (1) A now matches C's final state exactly,
+ * and (2) every doc neither A nor C touched survived the whole loop byte-identical. A
+ * structural mismatch at any hop, or any drift on the untouched docs, is a failure.
  *
  * Skipped entirely unless TEST_ENV=production - only runs when explicitly invoked.
  *
@@ -217,7 +226,7 @@ maybeDescribe('Production Replication Round-Trip', () => {
         console.log(`\nProduction Replication report written to: ${REPORT_DIR}`);
     }, 60000);
 
-    it('replicates memory -> Drive -> memory and preserves every document + revision', async () => {
+    it('replicates memory -> Drive -> memory -> memory in a full loop without drift', async () => {
         record('=== Production Replication Round-Trip ===');
         record('dbName (Drive hub):', dbName);
         record('docCount:', DOC_COUNT);
@@ -271,8 +280,80 @@ maybeDescribe('Production Replication Round-Trip', () => {
         const cDocs = docsById((await targetC.allDocs({ include_docs: true })).rows);
         const cmpBC = compareDocSets('B -> C', bDocs, cDocs, record);
         comparisons.push(cmpBC);
-        const cmpAC = compareDocSets('A -> C (full round trip)', aDocs, cDocs, record);
+        const cmpAC = compareDocSets('A -> C (transitively, via B)', aDocs, cDocs, record);
         comparisons.push(cmpAC);
+
+        // --- Phase 4: replicate C (memory) -> A (memory), closing the loop -----------
+        // C's data is just a mirror of A's, so this should be a no-op from PouchDB's point
+        // of view (the checkpoint/revsDiff machinery should find nothing new to write) -
+        // but actually running it, rather than assuming, is the point: it proves the whole
+        // loop (A -> B -> C -> A) round-trips without corrupting or drifting A's data, which
+        // is the real-world shape of two devices syncing through a shared Drive folder.
+        record('--- Phase 4: replicating C -> A, closing the loop back to the origin (idempotency check) ---');
+        const t2 = Date.now();
+        await replicateOnce(targetC, sourceA, record);
+        record(`C -> A replication complete in ${Date.now() - t2}ms`);
+
+        const aDocsAfterIdempotentLoop = docsById((await sourceA.allDocs({ include_docs: true })).rows);
+        const cmpCA = compareDocSets('C -> A (closing the loop, idempotent)', cDocs, aDocsAfterIdempotentLoop, record);
+        comparisons.push(cmpCA);
+        const cmpNoDriftIdempotent = compareDocSets('A before vs after idempotent loop (no-drift check)', aDocs, aDocsAfterIdempotentLoop, record);
+        comparisons.push(cmpNoDriftIdempotent);
+
+        // --- Phase 5: C makes its OWN writes - new docs, and updates to docs that ------
+        // originated on A. The idempotent C -> A leg above doesn't prove bidirectional
+        // sync actually works, since C was still just an untouched mirror at that point.
+        // The real-world scenario is two devices syncing through a shared Drive folder,
+        // where BOTH sides write; this phase makes C do that.
+        record('--- Phase 5: making local writes on C (updates to A-originated docs + brand new docs) ---');
+        const updatedOnC = ['doc-2', 'doc-3']; // untouched by A's own Phase 1 updates (doc-0/doc-1)
+        for (const id of updatedOnC) {
+            const existing: any = await targetC.get(id);
+            existing.updatedByC = true;
+            existing.payload = 'c-edit-' + existing.payload;
+            await targetC.put(existing);
+        }
+        const newOnC = ['c-doc-0', 'c-doc-1'];
+        for (const id of newOnC) {
+            await targetC.put({ _id: id, origin: 'C', payload: 'created directly on C' });
+        }
+        record('C doc count after local writes:', (await targetC.info()).doc_count);
+
+        // --- Phase 6: push C's changes back into the Drive hub (C -> B) ----------------
+        record("--- Phase 6: replicating C's changes into the Drive hub (C -> B) ---");
+        const t3 = Date.now();
+        await replicateOnce(targetC, hubB, record);
+        record(`C -> B replication complete in ${Date.now() - t3}ms`);
+
+        const cDocsAfterWrites = docsById((await targetC.allDocs({ include_docs: true })).rows);
+        const bDocsAfterPush = docsById((await hubB.allDocs({ include_docs: true })).rows);
+        const cmpCB = compareDocSets("C -> B (C's writes landed in the Drive hub)", cDocsAfterWrites, bDocsAfterPush, record);
+        comparisons.push(cmpCB);
+
+        // --- Phase 7: pull the hub's now-merged state down to A (B -> A) ---------------
+        // This is what actually proves bidirectional sync: A should end up with its own
+        // untouched docs, PLUS C's updates to doc-2/doc-3, PLUS C's brand new docs - all
+        // delivered through the same Drive-backed adapter that wrote them.
+        record('--- Phase 7: replicating the merged hub state down to A (B -> A) ---');
+        const t4 = Date.now();
+        await replicateOnce(hubB, sourceA, record);
+        record(`B -> A replication complete in ${Date.now() - t4}ms`);
+
+        const aDocsAfterFullLoop = docsById((await sourceA.allDocs({ include_docs: true })).rows);
+        const cmpFinal = compareDocSets('A after full loop vs C (should now fully match)', cDocsAfterWrites, aDocsAfterFullLoop, record);
+        comparisons.push(cmpFinal);
+
+        // Docs neither A nor C ever touched should have survived the whole session
+        // byte-identical - proof the round trip doesn't silently corrupt unrelated data.
+        const untouchedIds = Object.keys(aDocs).filter(id => !updatedOnC.includes(id));
+        const aDocsUntouchedBefore: Record<string, any> = {};
+        const aDocsUntouchedAfter: Record<string, any> = {};
+        for (const id of untouchedIds) {
+            aDocsUntouchedBefore[id] = aDocs[id];
+            aDocsUntouchedAfter[id] = aDocsAfterFullLoop[id];
+        }
+        const cmpNoDrift = compareDocSets('Untouched docs before vs after full session (no-drift check)', aDocsUntouchedBefore, aDocsUntouchedAfter, record);
+        comparisons.push(cmpNoDrift);
 
         // --- Report ----------------------------------------------------------------
         const report = {
@@ -287,5 +368,10 @@ maybeDescribe('Production Replication Round-Trip', () => {
         expect(cmpAB.ok).toBe(true);
         expect(cmpBC.ok).toBe(true);
         expect(cmpAC.ok).toBe(true);
-    }, 120000);
+        expect(cmpCA.ok).toBe(true);
+        expect(cmpNoDriftIdempotent.ok).toBe(true);
+        expect(cmpCB.ok).toBe(true);
+        expect(cmpFinal.ok).toBe(true);
+        expect(cmpNoDrift.ok).toBe(true);
+    }, 210000);
 });

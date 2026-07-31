@@ -174,10 +174,11 @@ approach: a plain `allDocs()` excludes deleted docs from the candidate set entir
 become a row); an `allDocs({ keys: [...] })` that explicitly names a deleted doc gets it back with
 `value.deleted: true, doc: null` rather than as an `error: 'not_found'` row — only keys absent from the
 index entirely are `not_found`. `total_rows` now counts live documents only, matching `info.doc_count`.
-The Production Replication tool (section 4 below) later found a sibling gap in the same function:
-`_local/*` documents (replication checkpoints, in particular) were never excluded from the candidate
-key set either, so they leaked into `allDocs()` results too — real CouchDB/PouchDB never surfaces
-`_local/*` docs there, they live in a separate namespace. Fixed alongside it.
+The Production Replication tool ([`docs/REPLICATION.ipynb`](REPLICATION.ipynb)) later found a sibling
+gap in the same function: `_local/*` documents (replication checkpoints, in particular) were never
+excluded from the candidate key set either, so they leaked into `allDocs()` results too — real
+CouchDB/PouchDB never surfaces `_local/*` docs there, they live in a separate namespace. Fixed
+alongside it.
 
 **`db.compact()` never resolved.** Calling the public `db.compact()` API hung forever, even though the
 compaction itself completed correctly on Drive (verifiable by watching the folder in the Drive UI
@@ -199,73 +200,17 @@ elsewhere in the file.
 ## 4. Production Replication Round-Trip
 
 `tests/production.replication.test.ts` verifies PouchDB's standard replication protocol works
-correctly *through* a real Google Drive-backed database, in both directions — the adapter's actual
-intended use case (sync a local PouchDB to Drive, pull it down on another device):
+correctly *through* a real Google Drive-backed database — both a no-op idempotency leg and a genuine
+bidirectional-writes leg (new docs plus updates to docs that originated on the other side), pushed
+through the Drive hub in both directions.
 
-```
-classical (memory) instance A --replicate--> Google Drive instance B
-Google Drive instance B       --replicate--> classical (memory) instance C
-```
-
-It writes documents and a couple of updates (second revisions) on A, replicates A → B, deep-compares
-every document **including its exact revision ID** (not just content) on B against A, then replicates
-B → C and compares C against both A and B the same way. A structural mismatch at either hop — missing
-docs, extra docs, wrong revision, wrong content — fails the test.
-
-### Running it
 ```bash
 npm run test:prod:replication
+# Windows: TEST_ENV=production npx jest tests/production.replication.test.ts
 ```
-(or, on Windows, `TEST_ENV=production npx jest tests/production.replication.test.ts` — see the Windows
-note in section 2.)
-
 Same `KEEP_TEST_DATA` / `PROD_TEST_DOC_COUNT` env vars as the explorer tool (section 3).
 
-### A test-harness gotcha worth knowing: `activeTasks`
-
-The very first version of this test hung forever with no error, no matter how long the timeout. Root
-cause turned out to be nothing to do with the Google Drive adapter: pouchdb-replication's internal
-`createTask()`/`completeReplication()` call `src.activeTasks.add/remove/update` unconditionally on
-whichever database is acting as the replication *source*. This adapter provides `activeTasks` for
-itself (see `src/adapter.ts`), but a plain `pouchdb-core` + `pouchdb-adapter-memory` instance (used here
-as the "classical" comparison instances) does not — `pouchdb-adapter-memory` apparently expects the
-full `pouchdb` package to supply it. So the first `memory -> gdrive` replication crashed deep inside
-pouchdb-replication with `Cannot read properties of undefined (reading 'add')`. Because that throw
-happens inside an internal, un-awaited promise chain, it never reaches the caller's `'error'` listener
-— from the outside, replication just hangs forever instead of failing loudly. The test works around
-this with a small polyfill (`ensureActiveTasks()`) applied to the memory-adapter instances; it's a
-gap in this bare-`pouchdb-core` test setup, not a bug in `src/`, so no adapter code changed for it.
-
-### Bugs this tool found and fixed
-
-**`db.bulkDocs(..., { new_edits: false })` silently discarded replicated revisions.** This is the most
-serious finding to date: replicating data *into* a Drive-backed database never actually preserved
-revision history. Every replicated document kept its correct content but was assigned a brand-new,
-fabricated revision instead of the one it arrived with — so `doc-0`'s real revision `2-258a45c9...`
-(with a correct 2-entry `_revisions.ids` ancestor chain) got silently replaced with something like
-`1-p6den3crcjdl8vns63` (a random hash at the wrong generation, with a corrupted 3-entry ancestor chain).
-Any later two-way sync with the original source would see these as a hard conflict, because the
-revision trees no longer agree on history — despite the content being identical.
-
-Root cause: `api.bulkDocs = api._bulkDocs` (in [`src/adapter.ts`](../src/adapter.ts)) aliases the public
-method straight to the adapter's own implementation, bypassing
-`AbstractPouchDB.prototype.bulkDocs` — the PouchDB core wrapper that normally copies `req.new_edits`
-onto `opts.new_edits` before calling the adapter (see `pouchdb-core/lib/index.js`). Because that
-normalization never ran, and `_bulkDocs` read `opts.new_edits !== false` instead of `req.new_edits !==
-false`, every replication write — which pouchdb-replication issues as
-`target.bulkDocs({ docs, new_edits: false }, { timeout })`, i.e. with `new_edits` on `req`, not
-`opts` — looked exactly like a normal, brand-new edit. The adapter then ran its default "mint a new
-revision on top of whatever's currently in the index" logic instead of trusting the incoming revision,
-exactly as if a first-time author had written the doc rather than a replicator delivering an existing
-one.
-
-This one was hard to see from the outside: `allDocs`/`get` still returned the *correct document
-content* (so a casual smoke test would pass), only `_rev`/`_revisions` were wrong. It only became
-visible by comparing revision IDs across the replication hop, which is exactly what this tool's
-`compareDocSets()` does (deliberately, not just comparing content) — a plain content-only diff would
-have missed it entirely. Fixed by reading `new_edits` from `req` instead of `opts`.
-
-This bug is also a flag that **every** `api.X = api._X` alias in this file (`get`, `allDocs`, `bulkGet`,
-`destroy`, ...) bypasses its corresponding `AbstractPouchDB.prototype.X` wrapper the same way `bulkDocs`
-did — worth keeping in mind if another PouchDB-core-level request/options normalization step turns out
-to matter for one of those in the future.
+Full write-up — the test topology, the `activeTasks` test-harness gotcha, the bugs it found (most
+notably `db.bulkDocs(..., { new_edits: false })` silently discarding replicated revisions), and the
+merged historical record of earlier replication fixes — lives in
+[`docs/REPLICATION.ipynb`](REPLICATION.ipynb).

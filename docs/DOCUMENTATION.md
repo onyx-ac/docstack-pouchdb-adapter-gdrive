@@ -58,4 +58,6 @@ Compaction is a critical maintenance task that merges the `snapshot-data` with r
 
 See [`docs/TESTING.md`](TESTING.md) for how to run the adapter against the local emulator, the real
 Google Drive API, and the structural/content audit tool used to catch clutter and correctness
-regressions.
+regressions. Replication specifically — the round-trip test tool, the bugs it's found, and the
+historical debugging record behind earlier replication fixes — is documented separately in
+[`docs/REPLICATION.ipynb`](REPLICATION.ipynb).
