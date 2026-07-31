@@ -682,6 +682,26 @@ export class DriveHandler {
             const oldLogIds = [...this.meta.changeLogIds];
             const oldIndexId = this.meta.snapshotIndexId;
 
+            // Resolve which snapshot-data file(s) the OLD index points to, so we can
+            // delete them too once the new snapshot is safely in place. Without this,
+            // every compaction leaves its predecessor's data file behind as orphaned
+            // clutter (the index gets cleaned up, but the (often much larger) data
+            // file it pointed to never does).
+            let oldDataFileIds: string[] = [];
+            if (oldIndexId) {
+                try {
+                    const oldIndex: SnapshotIndex = await this.downloadJson(oldIndexId, true);
+                    const ids = new Set<string>();
+                    for (const entry of Object.values(oldIndex.entries || {})) {
+                        const fid = (entry as IndexEntry).location?.fileId;
+                        if (fid && fid !== 'LEGACY_MEMORY') ids.add(fid);
+                    }
+                    oldDataFileIds = [...ids];
+                } catch (e) {
+                    this.log('Failed to load old snapshot index for data-file cleanup', oldIndexId, e);
+                }
+            }
+
             // 1. Fetch ALL active documents
             // We need them to build the new large snapshot-data file
             // This is the one time we download everything if not cached. 
@@ -755,8 +775,11 @@ export class DriveHandler {
                 };
             });
 
-            // 5. Cleanup - Only delete files that were confirmed removed from metadata
-            await this.cleanupOldFiles(oldIndexId, filesToDelete);
+            // 5. Cleanup - Only delete files that were confirmed removed from metadata.
+            // Also delete the old snapshot-data file(s) the old index pointed to (excluding
+            // the freshly-created one, which can't appear here since it's brand new).
+            const staleDataFileIds = oldDataFileIds.filter(id => id !== dataFileId);
+            await this.cleanupOldFiles(oldIndexId, [...filesToDelete, ...staleDataFileIds]);
             this.currentLogSizeEstimate = 0;
         } finally {
             this.isCompacting = false;

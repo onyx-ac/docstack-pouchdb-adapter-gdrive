@@ -7,7 +7,9 @@
   "scripts": {
     "build": "tsc",
     "test": "jest",
-    "test:prod": "TEST_ENV=production jest"
+    "test:prod": "TEST_ENV=production jest",
+    "test:prod:explore": "TEST_ENV=production jest tests/production.explore.test.ts",
+    "test:prod:replication": "TEST_ENV=production jest tests/production.replication.test.ts"
   },
   "keywords": [
     "pouchdb",

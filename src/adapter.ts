@@ -232,74 +232,72 @@ export function GoogleDriveAdapter(PouchDB: any) {
             }
 
             const promise = (async () => {
-                const keys = await db.getIndexKeys();
-                const total = keys.length; // Total keys (including deleted?)
+                // _local/* docs live in a separate namespace and never appear in allDocs,
+                // same as CouchDB - they aren't part of the B-tree of regular documents.
+                const indexKeys = (await db.getIndexKeys()).filter(k => !k.startsWith('_local/'));
 
-                let startIndex = opts.skip || 0;
-                let limit = typeof opts.limit === 'number' ? opts.limit : keys.length;
-
-                let filteredKeys = keys;
-                if (opts.startkey) filteredKeys = filteredKeys.filter(k => k >= opts.startkey);
-                if (opts.endkey) filteredKeys = filteredKeys.filter(k => k <= opts.endkey);
-                if (opts.key) filteredKeys = filteredKeys.filter(k => k === opts.key);
-                if (opts.keys) filteredKeys = opts.keys;
-
-                filteredKeys.sort();
-                if (opts.descending) filteredKeys.reverse();
-
-                const sliced = filteredKeys.slice(startIndex, startIndex + limit);
-
-                // Fetch actual docs if needed
-                if (opts.include_docs) {
-                    const docs = await db.getMulti(sliced);
-                    const rows = sliced.map((id, i) => {
-                        const doc = docs[i];
-                        const entry = db.getIndexEntry(id);
-
-                        if (!doc && (!entry || entry.deleted)) return { key: id, error: 'not_found' };
-                        if (!doc && entry) {
-                            // This implies fetch failed but exists in index? Or null result.
-                            return { key: id, error: 'not_found' };
-                        }
-
-                        const row: any = {
-                            id,
-                            key: id,
-                            value: { rev: entry?.rev || doc._rev }
-                        };
-                        row.doc = doc;
-                        return row;
-                    });
-
-                    const result: any = {
-                        total_rows: total,
-                        offset: startIndex,
-                        rows: rows.filter(r => !r.error || !opts.keys) // Filter errored unless specifically asked via keys?
-                        // CouchDB usually returns error row if distinct keys requested.
-                    };
-                    if (opts.update_seq) result.update_seq = db.seq;
-                    return result;
-
-                } else {
-                    // Index only (Fast!)
-                    const rows = sliced.map(id => {
-                        const entry = db.getIndexEntry(id);
-                        if (!entry || entry.deleted) return { key: id, error: 'not_found' };
-                        return {
-                            id,
-                            key: id,
-                            value: { rev: entry.rev }
-                        };
-                    });
-
-                    const result: any = {
-                        total_rows: total,
-                        offset: startIndex,
-                        rows
-                    };
-                    if (opts.update_seq) result.update_seq = db.seq;
-                    return result;
+                // total_rows reflects live (non-deleted) documents, matching db.info().doc_count -
+                // deleted entries stay in the index forever but were never meant to count here.
+                let total = 0;
+                for (const k of indexKeys) {
+                    const entry = db.getIndexEntry(k);
+                    if (entry && !entry.deleted) total++;
                 }
+
+                const startIndex = opts.skip || 0;
+
+                let candidateKeys: string[];
+                if (opts.keys) {
+                    // Explicit keys: return exactly these, in the given order. Deleted docs are
+                    // included here (flagged via value.deleted), not treated as errors - only
+                    // keys absent from the index entirely are 'not_found'.
+                    candidateKeys = opts.keys;
+                } else {
+                    // Default listing: deleted docs never appear, same as a real CouchDB/PouchDB
+                    // allDocs() with no keys specified.
+                    candidateKeys = indexKeys.filter(k => {
+                        const entry = db.getIndexEntry(k);
+                        return entry && !entry.deleted;
+                    });
+                    if (opts.startkey) candidateKeys = candidateKeys.filter(k => k >= opts.startkey);
+                    if (opts.endkey) candidateKeys = candidateKeys.filter(k => k <= opts.endkey);
+                    if (opts.key) candidateKeys = candidateKeys.filter(k => k === opts.key);
+                    candidateKeys.sort();
+                    if (opts.descending) candidateKeys.reverse();
+                }
+
+                const limit = typeof opts.limit === 'number' ? opts.limit : candidateKeys.length;
+                const sliced = opts.keys ? candidateKeys : candidateKeys.slice(startIndex, startIndex + limit);
+
+                const docs = opts.include_docs ? await db.getMulti(sliced) : null;
+
+                const rows = sliced.map((id, i) => {
+                    const entry = db.getIndexEntry(id);
+
+                    if (!entry) return { key: id, error: 'not_found' };
+
+                    if (entry.deleted) {
+                        const row: any = { id, key: id, value: { rev: entry.rev, deleted: true } };
+                        if (opts.include_docs) row.doc = null;
+                        return row;
+                    }
+
+                    const row: any = { id, key: id, value: { rev: entry.rev } };
+                    if (opts.include_docs) {
+                        const doc = docs![i];
+                        if (!doc) return { key: id, error: 'not_found' };
+                        row.doc = doc;
+                    }
+                    return row;
+                });
+
+                const result: any = {
+                    total_rows: total,
+                    offset: startIndex,
+                    rows
+                };
+                if (opts.update_seq) result.update_seq = db.seq;
+                return result;
             })();
 
             if (callback) {
@@ -358,7 +356,10 @@ export function GoogleDriveAdapter(PouchDB: any) {
         api._bulkDocs = function (req: any, opts: any, callback: any): Promise<any> | void {
             const docs = req.docs;
             const results: any[] = [];
-            const newEdits = opts.new_edits !== false;
+            // new_edits lives on `req` (the CouchDB _bulk_docs request body shape), not `opts`.
+            // api.bulkDocs = api._bulkDocs below means callers reach this directly, bypassing
+            // AbstractPouchDB.prototype.bulkDocs's req->opts normalization - so read it from req.
+            const newEdits = req.new_edits !== false;
             const changes: ChangeEntry[] = [];
 
             // We need to validate revisions against Index
@@ -555,7 +556,11 @@ export function GoogleDriveAdapter(PouchDB: any) {
 
 
         // Manual compaction trigger
-        api._compact = function (callback: any): Promise<any> | void {
+        api._compact = function (opts: any, callback: any): Promise<any> | void {
+            if (typeof opts === 'function') {
+                callback = opts;
+                opts = {};
+            }
             const promise = db.compact().then(() => {
                 const result = { ok: true };
                 if (callback) callback(null, result);
