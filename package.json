@@ -30,7 +30,9 @@
     "node": ">=18"
   },
   "dependencies": {
-    "pouchdb-core": "^7.3.1"
+    "pouchdb-core": "^7.3.1",
+    "pouchdb-merge": "^9.0.0",
+    "pouchdb-adapter-utils": "^9.0.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

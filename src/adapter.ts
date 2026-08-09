@@ -1,5 +1,7 @@
-import { GoogleDriveAdapterOptions, ChangeEntry } from './types';
+import { GoogleDriveAdapterOptions, ChangeEntry, FilePointer, IndexEntry } from './types';
 import { DriveHandler } from './drive';
+import { parseDoc } from 'pouchdb-adapter-utils';
+import { merge, winningRev, isDeleted as isRevDeleted, revExists, collectConflicts } from 'pouchdb-merge';
 
 /**
  * Schedule a function to run asynchronously.
@@ -8,6 +10,18 @@ function nextTick(fn: () => void): void {
     if (typeof fn === 'function') {
         queueMicrotask(fn);
     }
+}
+
+/** Substituted by DriveHandler.updateIndex() once the batch's change-log file
+ *  actually has an id - lets adapter.ts build a complete IndexEntry (including
+ *  pointers at revisions being written in *this* batch) before that file exists. */
+const SELF_FILE = '__SELF__';
+
+/** True when a newEdits write's parent rev isn't actually present in the tree
+ *  (the caller claimed a rev that doesn't exist) - same check, same name,
+ *  `pouchdb-adapter-native` uses (traced from pouchdb-adapter-utils's processDocs.js). */
+function rootIsMissing(docInfo: any): boolean {
+    return docInfo.metadata.rev_tree[0].ids[1].status === 'missing';
 }
 
 /** Combined options type for PouchDB adapter */
@@ -175,10 +189,30 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 opts = {};
             }
 
-            // PouchDB sometimes asks for metadata only (revs, revs_info) 
+            // PouchDB sometimes asks for metadata only (revs, revs_info)
             log('_get id:', id, 'opts:', JSON.stringify(opts));
 
-            const promise = db.get(id).then(doc => {
+            // A specific non-winning rev was requested (e.g. to inspect a conflict
+            // via db.get(id, {rev, conflicts: true})'s follow-up fetch) - look it up
+            // among known conflict locations instead of always returning the current
+            // winner. The common case (no rev, or rev === the winner) is unaffected.
+            // api.get = api._get below means this replaces the whole public `get()`
+            // method (same "no _-prefixed hook, override the public method instead"
+            // situation @docstack/pouchdb-adapter-native's own revsDiff/bulkGet ran
+            // into) - AbstractPouchDB.prototype.get's own opts.conflicts handling
+            // (pouchdbMerge.collectConflicts(metadata)) is bypassed entirely, so it
+            // has to be done here instead.
+            const entry = db.getIndexEntry(id);
+
+            const fetchPromise: Promise<any> = (async () => {
+                if (opts.rev && entry && entry.rev !== opts.rev) {
+                    const loc = entry.conflictLocations && entry.conflictLocations[opts.rev];
+                    return loc ? db.getRevisionBody(id, opts.rev, loc) : null;
+                }
+                return db.get(id);
+            })();
+
+            const promise = fetchPromise.then(doc => {
                 if (!doc) {
                     log('_get missing', id);
                     const err = {
@@ -200,6 +234,11 @@ export function GoogleDriveAdapter(PouchDB: any) {
                     const result = [{ ok: doc }];
                     if (callback) callback(null, result);
                     return result;
+                }
+
+                if (opts.conflicts && entry) {
+                    const conflicts = collectConflicts({ rev_tree: JSON.parse(entry.tree) });
+                    if (conflicts.length) doc._conflicts = conflicts;
                 }
 
                 log('_get returning standard doc for:', id);
@@ -314,33 +353,37 @@ export function GoogleDriveAdapter(PouchDB: any) {
             const docs = opts.docs;
             const ids = docs.map((d: any) => d.id);
 
-            return db.getMulti(ids).then(results => {
-                const response = {
-                    results: ids.map((id: string, i: number) => {
-                        const doc = results[i];
-                        const requestedRev = docs[i].rev;
-                        const entry = db.getIndexEntry(id);
+            return db.getMulti(ids).then(async results => {
+                const rows = await Promise.all(ids.map(async (id: string, i: number) => {
+                    let doc = results[i];
+                    const requestedRev = docs[i].rev;
+                    const entry = db.getIndexEntry(id);
 
-                        let docResult: any;
-                        if (!doc || (requestedRev && doc._rev !== requestedRev)) {
-                            docResult = {
-                                error: {
-                                    status: 404,
-                                    error: true,
-                                    name: 'not_found',
-                                    message: 'missing'
-                                }
-                            };
-                        } else {
-                            docResult = { ok: doc };
-                        }
+                    // Winning body didn't match the specific rev requested - it may
+                    // still be a known conflict leaf, not necessarily missing.
+                    if (requestedRev && (!doc || doc._rev !== requestedRev) && entry) {
+                        const loc = entry.conflictLocations && entry.conflictLocations[requestedRev];
+                        if (loc) doc = await db.getRevisionBody(id, requestedRev, loc);
+                    }
 
-                        return {
-                            id,
-                            docs: [docResult]
+                    let docResult: any;
+                    if (!doc || (requestedRev && doc._rev !== requestedRev)) {
+                        docResult = {
+                            error: {
+                                status: 404,
+                                error: true,
+                                name: 'not_found',
+                                message: 'missing'
+                            }
                         };
-                    })
-                };
+                    } else {
+                        docResult = { ok: doc };
+                    }
+
+                    return { id, docs: [docResult] };
+                }));
+
+                const response = { results: rows };
                 if (callback) callback(null, response);
                 return response;
             }).catch((err: any) => {
@@ -352,88 +395,143 @@ export function GoogleDriveAdapter(PouchDB: any) {
         api.bulkGet = api._bulkGet;
 
 
-        // Bulk document operations
+        // Bulk document operations. Merges every write into a real pouchdb-merge
+        // rev tree (mirroring @docstack/pouchdb-adapter-native's own, already-proven
+        // _bulkDocs, traced from pouchdb-adapter-utils's processDocs.js/updateDoc.js)
+        // instead of blindly overwriting the index - the previous version had no
+        // conflict detection at all on the new_edits:false (replication) path, so
+        // two peers syncing a concurrent edit through this adapter would each just
+        // keep whichever write landed last, silently disagreeing with each other.
         api._bulkDocs = function (req: any, opts: any, callback: any): Promise<any> | void {
             const docs = req.docs;
-            const results: any[] = [];
+            const results: any[] = new Array(docs.length);
             // new_edits lives on `req` (the CouchDB _bulk_docs request body shape), not `opts`.
             // api.bulkDocs = api._bulkDocs below means callers reach this directly, bypassing
             // AbstractPouchDB.prototype.bulkDocs's req->opts normalization - so read it from req.
             const newEdits = req.new_edits !== false;
+            const revsLimit = (adapterOpts as any).revs_limit || 1000;
             const changes: ChangeEntry[] = [];
 
-            // We need to validate revisions against Index
-            // This does NOT require fetching bodies usually
-
-            for (const doc of docs) {
+            for (let i = 0; i < docs.length; i++) {
+                const doc = docs[i];
                 const id = doc._id;
-                const seq = db.getNextSeq() + changes.length;
                 const entry = db.getIndexEntry(id);
 
-                if (doc._deleted) {
-                    if (!entry || entry.deleted) {
-                        results.push({
-                            ok: false,
-                            id,
-                            error: 'not_found',
-                            reason: 'missing'
-                        });
+                const docInfo: any = parseDoc(Object.assign({}, doc), newEdits);
+                if (!docInfo || !docInfo.metadata) {
+                    results[i] = Object.assign({ id }, docInfo);
+                    continue;
+                }
+
+                let mergedTree: any;
+                let stemmedRevs: string[];
+                let winning: string;
+                let winningDeleted: boolean;
+                let selfIsWinner: boolean;
+                let incomingRev: string;
+                let savedDocInfo = docInfo;
+                const conflictLocations: Record<string, FilePointer> = {};
+
+                if (!entry) {
+                    // Brand new doc.
+                    if (newEdits && rootIsMissing(docInfo)) {
+                        results[i] = { ok: false, id, error: 'conflict', reason: 'Document update conflict' };
+                        continue;
+                    }
+                    const merged = merge([], docInfo.metadata.rev_tree[0], revsLimit);
+                    mergedTree = merged.tree;
+                    stemmedRevs = merged.stemmedRevs;
+                    winning = winningRev({ rev_tree: mergedTree });
+                    winningDeleted = isRevDeleted({ rev_tree: mergedTree }, winning);
+                    incomingRev = docInfo.metadata.rev!;
+                    selfIsWinner = true; // an empty starting tree can only ever produce one leaf
+                } else {
+                    const existingTree = JSON.parse(entry.tree);
+                    if (revExists(existingTree, docInfo.metadata.rev!) && !newEdits) {
+                        // Replication redelivering a rev we already have - a no-op.
+                        results[i] = { ok: true, id, rev: docInfo.metadata.rev };
                         continue;
                     }
 
-                    // Check rev
-                    const oldRev = entry.rev || '0-0'; // Index has latest
-                    // If mismatch? PouchDB handles conflict logic before calling us sometimes?
-                    // But we should verify. 
-                    // If doc._rev matches entry.rev, we are good.
+                    const previousWinningRev = entry.rev;
+                    const previouslyDeleted = !!entry.deleted;
+                    let deleted = docInfo.metadata.deleted !== undefined ? docInfo.metadata.deleted : false;
+                    const isRoot = /^1-/.test(docInfo.metadata.rev!);
 
-                    const revNum = parseInt(oldRev.split('-')[0], 10) + 1;
-                    const newRev = revNum + '-' + generateRevId();
-
-                    changes.push({
-                        seq,
-                        id,
-                        rev: newRev,
-                        deleted: true,
-                        timestamp: Date.now()
-                    });
-
-                    results.push({ ok: true, id, rev: newRev });
-                } else {
-                    let newRev: string;
-                    let savedDoc: any;
-
-                    if (newEdits) {
-                        const oldRev = entry?.rev || '0-0';
-                        const revNum = parseInt(oldRev.split('-')[0], 10) + 1;
-                        const revHash = generateRevId();
-                        newRev = revNum + '-' + revHash;
-
-                        savedDoc = Object.assign({}, doc, { _rev: newRev });
-                        if (doc._revisions) {
-                            savedDoc._revisions = {
-                                start: revNum,
-                                ids: [revHash, ...(doc._revisions.ids || [])]
-                            };
-                            if (savedDoc._revisions.ids.length > 500) {
-                                savedDoc._revisions.ids = savedDoc._revisions.ids.slice(0, 500);
-                            }
+                    // Undeleting via a fresh newEdits put re-parents onto the tombstone
+                    // rev instead of conflicting (CouchDB "resurrection").
+                    if (previouslyDeleted && !deleted && newEdits && isRoot) {
+                        const resurrected = Object.assign({}, docInfo.data, { _id: id, _rev: previousWinningRev });
+                        const reparsed: any = parseDoc(resurrected, newEdits);
+                        if (!reparsed || !reparsed.metadata) {
+                            results[i] = Object.assign({ id }, reparsed);
+                            continue;
                         }
-                    } else {
-                        newRev = doc._rev;
-                        savedDoc = Object.assign({}, doc, { _rev: newRev });
+                        savedDocInfo = reparsed;
+                        deleted = savedDocInfo.metadata.deleted !== undefined ? savedDocInfo.metadata.deleted : false;
                     }
 
-                    changes.push({
-                        seq,
-                        id,
-                        rev: newRev,
-                        doc: savedDoc,
-                        timestamp: Date.now()
-                    });
+                    const merged = merge(existingTree, savedDocInfo.metadata.rev_tree[0], revsLimit);
+                    const inConflict =
+                        newEdits &&
+                        ((previouslyDeleted && deleted && merged.conflicts !== 'new_leaf') ||
+                            (!previouslyDeleted && merged.conflicts !== 'new_leaf') ||
+                            (previouslyDeleted && !deleted && merged.conflicts === 'new_branch'));
+                    if (inConflict) {
+                        results[i] = { ok: false, id, error: 'conflict', reason: 'Document update conflict' };
+                        continue;
+                    }
 
-                    results.push({ ok: true, id, rev: newRev });
+                    mergedTree = merged.tree;
+                    stemmedRevs = merged.stemmedRevs;
+                    winning = winningRev({ rev_tree: mergedTree });
+                    winningDeleted = isRevDeleted({ rev_tree: mergedTree }, winning);
+                    incomingRev = savedDocInfo.metadata.rev!;
+                    selfIsWinner = incomingRev === winning;
+
+                    // Carry forward existing conflicts, minus anything just stemmed
+                    // past revs_limit (pouchdb-adapter-native's own stemBodies
+                    // handles the equivalent body cleanup for its own storage;
+                    // compact() here does the same, see drive.ts).
+                    if (entry.conflictLocations) {
+                        for (const rev of Object.keys(entry.conflictLocations)) {
+                            if (!stemmedRevs.includes(rev)) conflictLocations[rev] = entry.conflictLocations[rev];
+                        }
+                    }
+                    if (selfIsWinner) {
+                        // The old winner becomes a conflict leaf, unless it just got stemmed.
+                        if (previousWinningRev !== winning && !stemmedRevs.includes(previousWinningRev)) {
+                            conflictLocations[previousWinningRev] = entry.location;
+                        }
+                    } else if (!stemmedRevs.includes(incomingRev)) {
+                        conflictLocations[incomingRev] = { fileId: SELF_FILE };
+                    }
                 }
+
+                const seq = db.getNextSeq() + changes.length;
+                const savedDoc = Object.assign({}, savedDocInfo.data, { _id: id, _rev: incomingRev });
+
+                const nextIndexEntry: Omit<IndexEntry, 'seq'> = {
+                    tree: JSON.stringify(mergedTree),
+                    rev: winning,
+                    deleted: winningDeleted,
+                    location: selfIsWinner ? { fileId: SELF_FILE } : entry!.location,
+                };
+                if (Object.keys(conflictLocations).length > 0) {
+                    nextIndexEntry.conflictLocations = conflictLocations;
+                }
+
+                changes.push({
+                    seq,
+                    id,
+                    rev: incomingRev,
+                    deleted: savedDocInfo.metadata.deleted,
+                    doc: savedDoc,
+                    timestamp: Date.now(),
+                    nextIndexEntry,
+                });
+
+                results[i] = { ok: true, id, rev: incomingRev };
             }
 
             log('_bulkDocs flushing', changes.length, 'changes');
@@ -577,16 +675,11 @@ export function GoogleDriveAdapter(PouchDB: any) {
             if (!entry) {
                 return callback({ status: 404, error: true, name: 'not_found', message: 'missing' });
             }
-
-            // Return a minimal tree based on the known winning revision
-            const revNum = parseInt(entry.rev.split('-')[0], 10);
-            const revHash = entry.rev.split('-')[1];
-
-            const revTree = [{
-                pos: revNum,
-                ids: [revHash, { status: 'available' }, []]
-            }];
-            callback(null, revTree);
+            // The real tree, as maintained by _bulkDocs's merge() calls - not a
+            // synthesized single-leaf stand-in. This is what makes PouchDB core's
+            // default revsDiff (which walks this) actually see conflicting revisions
+            // instead of only ever knowing about "whatever's currently winning".
+            callback(null, JSON.parse(entry.tree));
         };
 
         api._close = function (callback: any): Promise<void> | void {

@@ -41,6 +41,16 @@ export interface ChangeEntry {
     doc?: Record<string, any>;
     /** Timestamp of the change */
     timestamp: number;
+    /**
+     * When set (computed by adapter.ts's `_bulkDocs` via pouchdb-merge before
+     * appending), fully describes the resulting IndexEntry for this doc - any
+     * `location`/`conflictLocations[rev]` that should point at *this* change's own
+     * (not-yet-uploaded) file is left as `{fileId: '__SELF__'}`;
+     * `DriveHandler.updateIndex()` substitutes the real fileId once known.
+     * Absent for the low-level `DriveHandler.appendChange()` API's raw callers
+     * (e.g. concurrency tests), which fall back to a synthesized single-node tree.
+     */
+    nextIndexEntry?: Omit<IndexEntry, 'seq'>;
 }
 
 /** Location pointer for lazy loading */
@@ -56,14 +66,24 @@ export interface FilePointer {
 
 /** In-Memory Index Entry */
 export interface IndexEntry {
-    /** Current revision */
+    /** Opaque pouchdb-merge rev tree, JSON-stringified. JS (this file's callers)
+     *  owns tree shape entirely - nothing here parses it beyond handing it to
+     *  pouchdb-merge's own functions. */
+    tree: string;
+    /** Winning revision, computed via pouchdb-merge's winningRev() - the real
+     *  deterministic CouchDB algorithm (generation, then lexicographic rev-hash
+     *  tie-break), not "whichever write landed last". */
     rev: string;
     /** Sequence number where this rev was minted */
     seq: number;
-    /** Whether it is a deletion marker */
+    /** Whether the winning revision is a deletion marker */
     deleted?: boolean;
-    /** Pointer to the file containing the body (changes-*.ndjson or snapshot-data-*.json) */
+    /** Pointer to the file containing the winning revision's body (changes-*.ndjson
+     *  or snapshot-data-*.json) */
     location: FilePointer;
+    /** Every OTHER known leaf's body location, keyed by rev string. Absent/empty
+     *  when there's no conflict. */
+    conflictLocations?: Record<string, FilePointer>;
 }
 
 /** Old Legacy Snapshot (Compact + Data) - Kept for migration */
@@ -85,8 +105,11 @@ export interface SnapshotIndex {
 
 /** New Snapshot Data (Bulk Content) */
 export interface SnapshotDataChunk {
-    /** Map of DocID -> Document Body */
+    /** Map of DocID -> Document Body (winning revision only) */
     docs: Record<string, any>;
+    /** Non-winning leaf bodies carried forward through compaction, DocID -> rev ->
+     *  Document Body. Absent when nothing in this chunk has a conflict. */
+    conflicts?: Record<string, Record<string, any>>;
 }
 
 /** Metadata file content */

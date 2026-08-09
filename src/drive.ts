@@ -15,6 +15,18 @@ const DEFAULT_COMPACTION_THRESHOLD = 100; // entries
 const DEFAULT_SIZE_THRESHOLD = 1024 * 1024; // 1MB
 const DEFAULT_CACHE_SIZE = 1000; // Number of docs
 
+/** A trivial single-node pouchdb-merge tree for a bare rev string - used where a
+ *  doc enters the index without going through _bulkDocs's real merge (local docs,
+ *  legacy-snapshot migration, and the low-level DriveHandler.appendChange() API's
+ *  raw callers). Correct as far as it goes (one leaf, no ancestry); these paths
+ *  never participate in replication conflict resolution anyway. */
+function synthesizeTree(rev: string, deleted?: boolean): string {
+    const dash = rev.indexOf('-');
+    const pos = dash >= 0 ? parseInt(rev.slice(0, dash), 10) : 0;
+    const hash = dash >= 0 ? rev.slice(dash + 1) : rev;
+    return JSON.stringify([{ pos, ids: [hash, { status: 'available', deleted: !!deleted }, []] }]);
+}
+
 /**
  * DriveHandler - Lazy Loading Implementation
  * 
@@ -242,6 +254,7 @@ export class DriveHandler {
                             for (const [id, doc] of Object.entries(localDocsChunk.docs)) {
                                 this.log('Merging local doc', id);
                                 this.index[id] = {
+                                    tree: synthesizeTree(doc._rev),
                                     rev: doc._rev,
                                     seq: 0, // Local docs don't participate in shared sequences
                                     location: { fileId: this.meta.localDocsId }
@@ -275,6 +288,7 @@ export class DriveHandler {
         // We will cache them ALL now (since we downloaded them) and index them.
         for (const [id, doc] of Object.entries(snapshot.docs)) {
             this.index[id] = {
+                tree: synthesizeTree(doc._rev),
                 rev: doc._rev,
                 seq: snapshot.seq, // Approximate
                 location: { fileId: 'LEGACY_MEMORY' } // Special validity marker
@@ -338,6 +352,37 @@ export class DriveHandler {
             doc._rev = entry.rev;
         }
 
+        return doc;
+    }
+
+    /**
+     * Fetch a specific (possibly non-winning/conflicting) revision's body by its
+     * own tracked location - used by _get(opts.rev)/_bulkGet when the requested
+     * rev isn't the current winner. Deliberately doesn't touch docCache (keyed
+     * per-id, not per-rev - a conflict fetch is rare enough not to warrant a
+     * per-rev cache key) and doesn't force `_rev` to the index's winning rev the
+     * way get() does.
+     */
+    async getRevisionBody(id: string, rev: string, location: FilePointer): Promise<any | null> {
+        if (location.fileId === 'LEGACY_MEMORY' || location.fileId === '__SELF__') return null;
+        const content = await this.fetchFile(location.fileId);
+
+        let doc: any = null;
+        if (Array.isArray(content)) {
+            const match = content.find((c: ChangeEntry) => c.id === id && c.rev === rev);
+            doc = match ? match.doc : null;
+        } else if (content && content.conflicts && content.conflicts[id]) {
+            doc = content.conflicts[id][rev] ?? null;
+        } else if (content && content.docs && content.docs[id]) {
+            // Winning body happened to be requested through this path (e.g. after
+            // a merge where the "conflict" turned out to be the new winner).
+            const candidate = content.docs[id];
+            if (candidate && candidate._rev === rev) doc = candidate;
+        } else if (content && content.id === id && content.rev === rev && content.doc) {
+            doc = content.doc;
+        }
+
+        if (doc) doc._rev = rev;
         return doc;
     }
 
@@ -597,8 +642,12 @@ export class DriveHandler {
     }
 
     private async tryAppendChanges(changes: ChangeEntry[]): Promise<void> {
-        // 1. Write Log File (Upload Data)
-        const fileId = await this.writeChangeFile(changes);
+        // 1. Write Log File (Upload Data). `nextIndexEntry` (the merged tree, only
+        // needed transiently by updateIndex() below) is stripped first - it's
+        // already durably captured by the index/snapshot system, so writing it into
+        // every change-log line too would just redundantly bloat storage, growing
+        // with tree depth on every single write.
+        const fileId = await this.writeChangeFile(changes.map(({ nextIndexEntry, ...rest }) => rest));
 
         try {
             // 2. Prepare speculative meta update
@@ -646,7 +695,30 @@ export class DriveHandler {
 
     /** Update Index with a new change */
     private updateIndex(change: ChangeEntry, fileId: string) {
+        if (change.nextIndexEntry) {
+            // adapter.ts already computed the full merged tree/winner/conflicts via
+            // pouchdb-merge - just substitute the '__SELF__' placeholder(s) with the
+            // fileId this batch actually landed in (unknown until upload completed).
+            const entry: IndexEntry = { ...change.nextIndexEntry, seq: change.seq };
+            if (entry.location.fileId === '__SELF__') entry.location = { fileId };
+            if (entry.conflictLocations) {
+                const resolved: Record<string, FilePointer> = {};
+                for (const rev of Object.keys(entry.conflictLocations)) {
+                    const loc = entry.conflictLocations[rev];
+                    resolved[rev] = loc.fileId === '__SELF__' ? { fileId } : loc;
+                }
+                entry.conflictLocations = resolved;
+            }
+            this.index[change.id] = entry;
+            return;
+        }
+
+        // Legacy path: no computed tree (the low-level DriveHandler.appendChange()
+        // API's raw callers - e.g. concurrency tests - never set nextIndexEntry).
+        // Synthesize a trivial single-node tree so the index entry shape stays
+        // consistent for anything reading `.tree` (e.g. _getRevisionTree).
         this.index[change.id] = {
+            tree: synthesizeTree(change.rev, change.deleted),
             rev: change.rev,
             seq: change.seq,
             deleted: !!change.deleted,
@@ -726,6 +798,37 @@ export class DriveHandler {
                 throw new Error(`Compaction failed: missing ${missingDocs.length} documents. Aborting to prevent data loss.`);
             }
 
+            // 1b. Carry forward conflict-branch bodies too. Without this, the first
+            // compaction after a real conflict exists would silently drop the losing
+            // revision forever - snapshotData only ever had room for one body per id
+            // before conflict tracking existed. A body that fails to fetch here is
+            // logged and dropped rather than aborting the whole compaction (unlike
+            // missingDocs above): losing one stale conflict branch is far less bad
+            // than losing a doc's current data, and shouldn't block reclaiming space.
+            const conflictFetches: Array<{ id: string; rev: string; location: FilePointer }> = [];
+            for (const id of allIds) {
+                const conflicts = this.index[id].conflictLocations;
+                if (!conflicts) continue;
+                for (const rev of Object.keys(conflicts)) {
+                    conflictFetches.push({ id, rev, location: conflicts[rev] });
+                }
+            }
+            const carriedConflicts: Record<string, Record<string, boolean>> = {};
+            if (conflictFetches.length > 0) {
+                snapshotData.conflicts = {};
+                for (const { id, rev, location } of conflictFetches) {
+                    const body = await this.getRevisionBody(id, rev, location);
+                    if (!body) {
+                        this.log('Compaction WARNING: could not fetch conflict body, dropping', id, rev);
+                        continue;
+                    }
+                    if (!snapshotData.conflicts[id]) snapshotData.conflicts[id] = {};
+                    snapshotData.conflicts[id][rev] = body;
+                    if (!carriedConflicts[id]) carriedConflicts[id] = {};
+                    carriedConflicts[id][rev] = true;
+                }
+            }
+
             // 2. Upload Data File
             const dataContent = JSON.stringify(snapshotData);
             const dataRes = await this.client.createFile(
@@ -739,11 +842,19 @@ export class DriveHandler {
             // 3. Create Index pointing to this Data File
             const newIndexEntries: Record<string, IndexEntry> = {};
             for (const id of Object.keys(snapshotData.docs)) {
-                newIndexEntries[id] = {
+                const entry: IndexEntry = {
+                    tree: this.index[id].tree,
                     rev: this.index[id].rev,
                     seq: this.index[id].seq,
                     location: { fileId: dataFileId }
                 };
+                if (carriedConflicts[id]) {
+                    entry.conflictLocations = {};
+                    for (const rev of Object.keys(carriedConflicts[id])) {
+                        entry.conflictLocations[rev] = { fileId: dataFileId };
+                    }
+                }
+                newIndexEntries[id] = entry;
             }
 
             const snapshotIndex: SnapshotIndex = {

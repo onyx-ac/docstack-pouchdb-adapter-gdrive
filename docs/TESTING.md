@@ -214,3 +214,45 @@ Full write-up — the test topology, the `activeTasks` test-harness gotcha, the 
 notably `db.bulkDocs(..., { new_edits: false })` silently discarding replicated revisions), and the
 merged historical record of earlier replication fixes — lives in
 [`docs/REPLICATION.ipynb`](REPLICATION.ipynb).
+
+## 5. Cross-adapter verification: no revision tree at all
+
+Found from *outside* this repo: `@docstack/pouchdb-adapter-native` (a sibling project, its own
+document-store-backed PouchDB adapter) added a real bidirectional-replication test against this
+adapter over real Google Drive, including a deliberate concurrent edit on both sides. Non-conflicting
+sync converged correctly; the concurrent-edit case did not — after `sync()`, the two peers each
+reported *the other's* edit as their own local winner.
+
+Root cause: this adapter had no revision tree at all. `IndexEntry` ([`src/types.ts`](../src/types.ts))
+tracked a single `{rev, seq, deleted, location}` per doc id — no branches, no ancestry, no conflict
+leaves. `_bulkDocs`'s `new_edits: false` path ([`src/adapter.ts`](../src/adapter.ts)) — what every
+replication pull uses — did no merge or conflict detection at all: it just overwrote the index entry
+with whatever arrived last. `_getRevisionTree` didn't return a real tree either; it synthesized a fake
+single-leaf tree from whatever `entry.rev` currently was, which is also why PouchDB core's default
+`revsDiff` couldn't detect real conflicts. (Old bodies weren't immediately destroyed - they survive in
+their original `changes-*.ndjson` log files until `compact()` runs - but `compact()` did collapse to
+one body per id, which would have silently dropped a conflict's losing branch the first time
+auto-compaction fired after one existed.)
+
+Fixed by porting `pouchdb-adapter-native`'s own already-proven `_bulkDocs` merge algorithm (traced
+from `pouchdb-adapter-utils`'s `processDocs.js`/`updateDoc.js`) onto this adapter's storage
+primitives, using the same two libraries directly (`pouchdb-adapter-utils`'s `parseDoc()`,
+`pouchdb-merge`'s `merge()`/`winningRev()`/`isDeleted()`/`revExists()`/`collectConflicts()` — added as
+real `dependencies`, not just `pouchdb-core`, and confirmed version-safe: they're pure tree/doc-shaping
+math with no dependency on which `pouchdb-core` major version registers the adapter):
+
+- `IndexEntry` gained `tree` (opaque `pouchdb-merge` rev tree, JSON) and
+  `conflictLocations` (every other known leaf's body location, by rev).
+- `_bulkDocs` merges every write into the real tree and computes the winner via `winningRev()`,
+  instead of blindly overwriting.
+- `_getRevisionTree` returns the real tree, which also makes `opts.conflicts` reporting correct
+  (this adapter does `api.get = api._get`, replacing the whole public method the same way
+  `pouchdb-adapter-native`'s own `revsDiff`/`bulkGet` had to for `pouchdb-core@9` — see its own
+  `03-docstack-adapter.md` spec — so `AbstractPouchDB.prototype.get`'s generic `opts.conflicts`
+  handling is bypassed and now has to happen here instead).
+- `_get`/`_bulkGet` can fetch a specific non-winning rev's body via `conflictLocations`.
+- `compact()` carries conflict bodies forward into the new snapshot instead of dropping them.
+
+Verified with this repo's own full suite (mock + `npm run test:prod`, including the section 4
+replication round-trip above) - all passing, no regressions - plus the new cross-adapter test in
+`pouchdb-adapter-native` itself (`test/replication-gdrive.spec.js`).
