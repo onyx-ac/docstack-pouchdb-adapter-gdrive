@@ -1,7 +1,7 @@
 import { GoogleDriveAdapterOptions, ChangeEntry, FilePointer, IndexEntry } from './types';
 import { DriveHandler } from './drive';
 import { parseDoc } from 'pouchdb-adapter-utils';
-import { merge, winningRev, isDeleted as isRevDeleted, revExists, collectConflicts } from 'pouchdb-merge';
+import { merge, winningRev, isDeleted as isRevDeleted, revExists, collectConflicts, collectLeaves } from 'pouchdb-merge';
 
 /**
  * Schedule a function to run asynchronously.
@@ -22,6 +22,39 @@ const SELF_FILE = '__SELF__';
  *  `pouchdb-adapter-native` uses (traced from pouchdb-adapter-utils's processDocs.js). */
 function rootIsMissing(docInfo: any): boolean {
     return docInfo.metadata.rev_tree[0].ids[1].status === 'missing';
+}
+
+/**
+ * Builds a change's `changes` array.
+ *
+ * `style: 'all_docs'` - which is what `pouchdb-replication` asks for, and its default -
+ * means "list every leaf of the revision tree, not just the winner". Reporting only the
+ * winner hides conflict leaves from the changes feed, so they are never fetched, never
+ * pushed, and the two replicas quietly disagree about which revisions exist. The winner
+ * goes first, as CouchDB orders it.
+ *
+ * @param entry - The index entry for the document, carrying the serialized rev tree.
+ * @param style - The `style` the caller asked for; anything but `'all_docs'` yields the
+ * winning revision alone.
+ * @returns The `changes` array for the changes feed.
+ */
+function buildChangesList(entry: IndexEntry, style?: string): { rev: string }[] {
+    const winner = [{ rev: entry.rev }];
+    if (style !== 'all_docs') return winner;
+
+    try {
+        const leaves = collectLeaves(JSON.parse(entry.tree));
+        if (!leaves || !leaves.length) return winner;
+        const others = leaves
+            .map(leaf => leaf.rev)
+            .filter(rev => rev !== entry.rev)
+            .map(rev => ({ rev }));
+        return [...winner, ...others];
+    } catch (e) {
+        // A tree that will not parse is a bigger problem than a missing conflict leaf;
+        // fall back to the winner rather than breaking the feed.
+        return winner;
+    }
 }
 
 /** Combined options type for PouchDB adapter */
@@ -403,12 +436,26 @@ export function GoogleDriveAdapter(PouchDB: any) {
         // two peers syncing a concurrent edit through this adapter would each just
         // keep whichever write landed last, silently disagreeing with each other.
         api._bulkDocs = function (req: any, opts: any, callback: any): Promise<any> | void {
+            // `api.bulkDocs = api._bulkDocs` below means callers reach this directly and
+            // AbstractPouchDB.prototype.bulkDocs never runs, so its two normalizations
+            // have to happen here instead.
+            //
+            // First, the request shape: `db.bulkDocs([doc])` is the common call style and
+            // core turns the array into an envelope before any adapter sees it.
+            if (Array.isArray(req)) req = { docs: req };
+
+            // Second, `new_edits`, which arrives on either side. `pouchdb-replication`
+            // puts it on `req` (the CouchDB _bulk_docs body shape); `bulkDocs(docs,
+            // { new_edits: false })` and `put(doc, { new_edits: false })` - which core
+            // routes through `bulkDocs` - put it on `opts`. Core consults `opts` first and
+            // falls back to `req`; reading only one side silently mints fresh revisions
+            // for writes that were meant to land verbatim.
+            const newEdits = (opts && typeof opts === 'object' && 'new_edits' in opts)
+                ? opts.new_edits !== false
+                : req.new_edits !== false;
+
             const docs = req.docs;
             const results: any[] = new Array(docs.length);
-            // new_edits lives on `req` (the CouchDB _bulk_docs request body shape), not `opts`.
-            // api.bulkDocs = api._bulkDocs below means callers reach this directly, bypassing
-            // AbstractPouchDB.prototype.bulkDocs's req->opts normalization - so read it from req.
-            const newEdits = req.new_edits !== false;
             const revsLimit = (adapterOpts as any).revs_limit || 1000;
             const changes: ChangeEntry[] = [];
 
@@ -576,12 +623,14 @@ export function GoogleDriveAdapter(PouchDB: any) {
                             const change: any = {
                                 id: id,
                                 seq: entry.seq,
-                                changes: [{ rev: entry.rev }]
+                                changes: buildChangesList(entry, opts.style)
                             };
 
                             if (opts.include_docs) {
-                                db.get(id).then(doc => {
-                                    change.doc = doc;
+                                // Same tombstone rule as the initial pass: a `null` body
+                                // makes a filtered replication drop the deletion.
+                                loadChangeBodies([{ id, entry }]).then(bodies => {
+                                    change.doc = bodies[id];
                                     if (opts.onChange) opts.onChange(change);
                                     lastSeq = Math.max(lastSeq, change.seq);
                                 }).catch(e => log('Live change body fetch error', e));
@@ -595,36 +644,98 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 cancelLive = db.onChange(liveListener);
             }
 
+            /**
+             * Fetches the document bodies for a whole batch in one pass.
+             *
+             * `getMulti` groups ids by the file that holds them, so a batch drawn from a
+             * single change-log file costs one download rather than one per document -
+             * which is what a serial `get()` per change was costing. This path is only
+             * ever taken because something asked for `include_docs`, and the one thing
+             * that always asks is a filtered replication: `pouchdb-replication` forces
+             * `include_docs: true` so it can run its filter over `change.doc`.
+             *
+             * Deleted documents have no body to fetch, and a `null` there is not
+             * harmless: `pouchdb-replication`'s `filterChange` substitutes `{}` for a
+             * missing `change.doc`, and a filter given `{}` has no id to judge, so it
+             * drops the change. A filtered replication would then never propagate a
+             * deletion. Emit the tombstone the rest of PouchDB expects instead.
+             */
+            async function loadChangeBodies(
+                batch: { id: string; entry: IndexEntry }[]
+            ): Promise<Record<string, any>> {
+                const bodies: Record<string, any> = {};
+                if (!batch.length) return bodies;
+
+                const tombstone = (row: { id: string; entry: IndexEntry }) => ({
+                    _id: row.id,
+                    _rev: row.entry.rev,
+                    _deleted: true
+                });
+
+                const live = batch.filter(row => !row.entry.deleted);
+                for (const row of batch) {
+                    if (row.entry.deleted) bodies[row.id] = tombstone(row);
+                }
+
+                if (!live.length) return bodies;
+
+                try {
+                    const docs = await db.getMulti(live.map(row => row.id));
+                    live.forEach((row, index) => {
+                        bodies[row.id] = docs[index] || tombstone(row);
+                    });
+                } catch (e) {
+                    log('_changes include_docs error', e);
+                    for (const row of live) bodies[row.id] = tombstone(row);
+                }
+
+                return bodies;
+            }
+
             // Process initial changes
             async function processChangesAsync() {
                 log('_changes processing since', since, 'limit', limit, 'live', !!opts.live);
                 const keys = await db.getIndexKeys();
-                let processed = 0;
 
-                for (const id of keys) {
-                    if (complete || processed >= limit) break;
-                    if (id.startsWith('_local/')) continue;
-                    const entry = db.getIndexEntry(id);
-                    if (!entry || entry.seq <= since) continue;
+                // The index is a plain object keyed by document id, so iterating it
+                // yields insertion order, not sequence order. Replication checkpoints on
+                // the highest seq in each batch and `limit` makes every batch a partial
+                // one, so an unordered batch can checkpoint past a change it never
+                // emitted - and that change is then never replicated again. Order by seq
+                // before the batch is cut.
+                const pending = keys
+                    .filter((id: string) => !id.startsWith('_local/'))
+                    .map((id: string) => ({ id, entry: db.getIndexEntry(id) }))
+                    .filter((row): row is { id: string; entry: IndexEntry } =>
+                        Boolean(row.entry) && row.entry!.seq > since)
+                    .sort((a, b) => a.entry.seq - b.entry.seq);
+
+                // `descending` reverses the order the changes come back in. Its `since`
+                // semantics are CouchDB's (walk down from the given seq) and are not
+                // implemented here; replication never asks for it.
+                if (opts.descending) pending.reverse();
+
+                // Cut the batch before fetching anything: `include_docs` costs a download
+                // per *file*, and there is no reason to pay it for changes beyond `limit`.
+                const batch = pending.slice(0, limit);
+                const bodies = opts.include_docs
+                    ? await loadChangeBodies(batch)
+                    : null;
+
+                for (const { id, entry } of batch) {
+                    if (complete) break;
 
                     const change: any = {
                         id: id,
                         seq: entry.seq,
-                        changes: [{ rev: entry.rev }]
+                        changes: buildChangesList(entry, opts.style)
                     };
 
-                    if (opts.include_docs) {
-                        try {
-                            change.doc = await db.get(id);
-                        } catch (e) {
-                            log('_changes include_docs error', e);
-                        }
-                    }
+                    if (bodies) change.doc = bodies[id];
 
                     if (opts.onChange) opts.onChange(change);
                     if (returnDocs) results.push(change);
 
-                    processed++;
                     lastSeq = Math.max(lastSeq, entry.seq);
                 }
 

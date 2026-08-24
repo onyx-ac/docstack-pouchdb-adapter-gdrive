@@ -33,4 +33,7 @@ declare module 'pouchdb-merge' {
   export function isDeleted(metadata: DocMetadata, rev?: string): boolean;
   export function revExists(tree: RevTree, rev: string): boolean;
   export function collectConflicts(metadata: DocMetadata): string[];
+
+  /** Every leaf in the tree, winner included, newest generation first. */
+  export function collectLeaves(tree: RevTree): { rev: string; opts: { deleted?: boolean } }[];
 }
