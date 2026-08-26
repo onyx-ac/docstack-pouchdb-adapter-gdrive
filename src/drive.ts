@@ -14,6 +14,8 @@ import { GoogleDriveClient } from './client';
 const DEFAULT_COMPACTION_THRESHOLD = 100; // entries
 const DEFAULT_SIZE_THRESHOLD = 1024 * 1024; // 1MB
 const DEFAULT_CACHE_SIZE = 1000; // Number of docs
+const META_COMMIT_RETRIES = 6; // read-modify-write attempts per _meta.json commit
+const RETIRED_LOG_HISTORY = 500; // tombstones kept for change logs compaction deleted
 
 /** A trivial single-node pouchdb-merge tree for a bare rev string - used where a
  *  doc enters the index without going through _bulkDocs's real merge (local docs,
@@ -59,6 +61,24 @@ export class DriveHandler {
     private metaMd5: string | null = null;
     private metaModifiedTime: string | null = null;
     private localDocsEtag: string | null = null;
+    private metaFileId: string | null = null;
+
+    /** Identifies this handler among the writers sharing a folder. Change-log
+     *  filenames carry it, so two writers can never produce the same name and an
+     *  orphaned log can be traced back to whoever wrote it. */
+    private readonly writerId: string = Math.random().toString(36).substring(2, 10);
+
+    /** Change-log file ids this handler wrote, minus any a compaction has retired.
+     *  Drive API v3 has no compare-and-swap (ETags were dropped), so another
+     *  writer's read-modify-write of _meta.json can drop a log id that landed in
+     *  between. Anything still in here but missing from the remote changeLogIds was
+     *  dropped that way and gets put back - see reconcileOwnLogs(). */
+    private ownLogIds: Set<string> = new Set();
+
+    /** Serializes this handler's own _meta.json read-modify-write cycles. Says
+     *  nothing about other clients - that is what commitMeta's verify pass is for -
+     *  but stops one handler racing itself when several writes are in flight. */
+    private metaLock: Promise<unknown> = Promise.resolve();
 
     // In-Memory Index: ID -> Metadata/Pointer
     private index: Record<string, IndexEntry> = {};
@@ -146,16 +166,21 @@ export class DriveHandler {
                     this.log('Retrieved folder', { folderId: this.folderId });
                 }
 
-                const metaFile = await this.findFile('_meta.json');
-                if (metaFile) {
-                    this.log('Retrieved meta file', { fileId: metaFile.fileId });
-                    this.meta = await this.downloadJson(metaFile.fileId, true); // No cache for meta
-                    this.metaEtag = metaFile.etag || null;
-                    this.metaMd5 = metaFile.md5Checksum || null;
-                    this.metaModifiedTime = metaFile.modifiedTime || null;
+                const current = await this.readRemoteMeta();
+                if (current) {
+                    this.log('Retrieved meta file', { fileId: current.pointer.fileId });
+                    this.adoptMeta(current.meta, current.pointer);
                 } else {
                     this.log('Meta file not found, creating new');
-                    await this.saveMeta(this.meta);
+                    await this.ensureMetaFile();
+                }
+
+                // A change log of ours that has fallen out of changeLogIds without a
+                // compaction retiring it was dropped by another writer's
+                // read-modify-write. Put it back before replaying, so this load sees
+                // its own writes - and so the next reader does too.
+                if (this.hasOrphanedOwnLogs(this.meta)) {
+                    await this.commitMeta((latest, repaired) => repaired ? latest : null);
                 }
 
                 if (this.meta.snapshotIndexId !== this.currentSnapshotIndexId) {
@@ -267,7 +292,13 @@ export class DriveHandler {
                     }
                 }
 
-                // 3. Start Polling ...
+                // 3. Start Polling (if enabled). Idempotent on purpose: load()
+                // runs again on every catch-up and retry, and restarting the
+                // interval each time would push the next tick further out for
+                // exactly as long as the client stays busy.
+                if (this.options.pollingIntervalMs) {
+                    this.startPolling(Number(this.options.pollingIntervalMs));
+                }
             } catch (e) {
                 console.error('Failed to load database', e);
                 throw e;
@@ -554,19 +585,15 @@ export class DriveHandler {
                 return await this.tryAppendChanges(remote);
             } catch (err: any) {
                 if (err.status === 412 || err.status === 409) {
-                    // Reload and RETRY
+                    // Reload and RETRY. No resequencing here - tryAppendChanges
+                    // stamps sequence numbers from a fresh read of _meta.json on
+                    // every attempt of its own.
                     await this.load();
                     // Check conflicts against Index (Metadata sufficient)
                     this.checkConflicts(remote);
 
-                    // Reseq
-                    let currentSeq = this.meta.seq;
-                    for (const change of remote) {
-                        currentSeq++;
-                        change.seq = currentSeq;
-                    }
                     attemptNum++;
-                    await new Promise(r => setTimeout(r, Math.random() * 500 + 100));
+                    await this.backoff(attemptNum);
                     continue;
                 }
                 throw err;
@@ -611,7 +638,8 @@ export class DriveHandler {
                 } else {
                     res = await this.client.createFile('_local_docs.json', [this.folderId!], 'application/json', content);
                     // Update Meta with new File ID
-                    await this.atomicUpdateMeta((latest) => ({ ...latest, localDocsId: res.id }));
+                    const localRes = res;
+                    await this.commitMeta((latest) => ({ ...latest, localDocsId: localRes.id }));
                 }
 
                 this.localDocsEtag = res.etag;
@@ -642,24 +670,94 @@ export class DriveHandler {
     }
 
     private async tryAppendChanges(changes: ChangeEntry[]): Promise<void> {
-        // 1. Write Log File (Upload Data). `nextIndexEntry` (the merged tree, only
-        // needed transiently by updateIndex() below) is stripped first - it's
-        // already durably captured by the index/snapshot system, so writing it into
-        // every change-log line too would just redundantly bloat storage, growing
-        // with tree depth on every single write.
-        const fileId = await this.writeChangeFile(changes.map(({ nextIndexEntry, ...rest }) => rest));
+        // Catching up on another writer's logs and failing to publish are separate
+        // failures, so they get separate budgets - a busy folder should not be able
+        // to spend the publish retries on catch-ups alone.
+        let catchUps = 0;
 
-        try {
-            // 2. Prepare speculative meta update
-            const nextMeta = { ...this.meta };
-            nextMeta.changeLogIds = [...nextMeta.changeLogIds, fileId];
-            nextMeta.seq = changes[changes.length - 1].seq;
+        for (let attempt = 0; attempt < META_COMMIT_RETRIES;) {
+            // 1. Take the sequence range from what Drive holds right now, not from
+            // this handler's cached copy - that copy is only refreshed on load, so
+            // two clients allocating from their own stale copies is exactly how two
+            // change logs end up claiming the same sequence number.
+            const current = await this.readRemoteMeta();
 
-            // 3. Commit Lock
-            await this.saveMeta(nextMeta, this.metaEtag);
+            // Catch up before writing. Another writer having appended since our last
+            // load means our index - and so the revision this write is built on - is
+            // out of date; replaying their logs first is what lets checkConflicts see
+            // the collision instead of us silently writing over them. (Previously
+            // this only happened when the metadata ETag came back 412, which Drive
+            // itself never does.)
+            if (current && this.hasUnprocessedLogs(current.meta)) {
+                if (++catchUps > META_COMMIT_RETRIES) {
+                    throw new Error('Could not catch up with concurrent writers');
+                }
+                await this.load();
+                // Only the low-level appendChange() callers are checked here.
+                // _bulkDocs has already resolved revisions through pouchdb-merge and
+                // expresses a collision as a conflict branch, not as a thrown error;
+                // failing its whole batch would be the wrong answer.
+                this.checkConflicts(changes.filter(c => !c.nextIndexEntry));
+                continue;
+            }
 
-            // 4. Update Local State
-            this.meta = nextMeta;
+            const observedSeq = current ? current.meta.seq : this.meta.seq;
+            const base = Math.max(observedSeq, this.meta.seq);
+            changes.forEach((change, i) => { change.seq = base + i + 1; });
+
+            // 2. Write Log File (Upload Data). `nextIndexEntry` (the merged tree, only
+            // needed transiently by updateIndex() below) is stripped first - it's
+            // already durably captured by the index/snapshot system, so writing it into
+            // every change-log line too would just redundantly bloat storage, growing
+            // with tree depth on every single write.
+            const fileId = await this.writeChangeFile(changes.map(({ nextIndexEntry, ...rest }) => rest));
+
+            // 3. Publish it. The modifier merges into whatever _meta.json holds at
+            // write time rather than replacing it, so a concurrent writer's logs
+            // survive; it abandons the commit if someone has taken the sequence
+            // range already stamped into our file, since those seqs would then
+            // collide with theirs.
+            let committed: MetaData | null;
+            try {
+                committed = await this.commitMeta(
+                    (latest) => {
+                        if (latest.seq !== observedSeq) return null;
+                        return {
+                            ...latest,
+                            // Idempotent: commitMeta may run this more than once.
+                            changeLogIds: latest.changeLogIds.includes(fileId)
+                                ? latest.changeLogIds
+                                : [...latest.changeLogIds, fileId],
+                            seq: base + changes.length
+                        };
+                    },
+                    { verify: (m) => m.changeLogIds.includes(fileId) }
+                );
+            } catch (err) {
+                this.discardLog(fileId);
+                throw err;
+            }
+
+            if (!committed) {
+                // Nothing references the log we just uploaded and its sequence
+                // numbers are stale, so it is not salvageable - drop it and redo the
+                // whole thing against fresh metadata.
+                this.log('Change log not published, retrying', { fileId, attempt });
+                this.discardLog(fileId);
+                await this.backoff(attempt++);
+                continue;
+            }
+
+            // Published: from here on this log is ours to defend if another writer
+            // drops it from the metadata.
+            this.ownLogIds.add(fileId);
+
+            // 4. Update Local State. Marking our own log processed keeps a later
+            // load() from replaying it: the entries we apply here carry the merged
+            // rev tree computed by _bulkDocs, while the log lines on Drive have it
+            // stripped, so a replay would overwrite real ancestry with a synthesized
+            // single-node tree.
+            this.processedLogIds.add(fileId);
 
             const changedDocs: Record<string, any> = {};
             for (const change of changes) {
@@ -686,11 +784,17 @@ export class DriveHandler {
                 this.currentLogSizeEstimate >= this.compactionSizeThreshold) {
                 this.compact().catch(e => console.error('Compaction failed', e));
             }
-        } catch (err) {
-            // Cleanup orphaned log file on metadata update failure
-            this.client.deleteFile(fileId).catch(e => this.log('Failed to cleanup orphaned log', fileId, e));
-            throw err;
+            return;
         }
+
+        throw new Error(`Failed to publish change log after ${META_COMMIT_RETRIES} attempts`);
+    }
+
+    /** Forget a change log we uploaded but never managed to reference from
+     *  _meta.json. Nothing points at it, so it is safe to remove. */
+    private discardLog(fileId: string): void {
+        this.ownLogIds.delete(fileId);
+        this.client.deleteFile(fileId).catch(e => this.log('Failed to clean up unreferenced log', fileId, e));
     }
 
     /** Update Index with a new change */
@@ -872,23 +976,45 @@ export class DriveHandler {
             );
             const newIndexId = indexRes.id;
 
-            // 4. Update Meta
+            // 4. Update Meta. Only the logs THIS handler had already replayed are
+            // retired; anything another writer appended in the meantime stays in
+            // changeLogIds and gets replayed on top of the new snapshot.
             let filesToDelete: string[] = [];
-            await this.atomicUpdateMeta((latest) => {
-                const remainingLogs = latest.changeLogIds.filter(id => !oldLogIds.includes(id));
-                // Only delete files that were in oldLogIds but not in remainingLogs
-                filesToDelete = oldLogIds.filter(id => !remainingLogs.includes(id));
-                return {
-                    ...latest,
-                    snapshotIndexId: newIndexId,
-                    changeLogIds: remainingLogs,
-                    lastCompaction: Date.now()
-                };
-            });
+            const committed = await this.commitMeta(
+                (latest) => {
+                    const remainingLogs = latest.changeLogIds.filter(id => !oldLogIds.includes(id));
+                    // Only delete files that were in oldLogIds but not in remainingLogs
+                    filesToDelete = oldLogIds.filter(id => !remainingLogs.includes(id));
+                    const retired = [...(latest.retiredLogIds || []), ...filesToDelete];
+                    return {
+                        ...latest,
+                        snapshotIndexId: newIndexId,
+                        changeLogIds: remainingLogs,
+                        // Tombstones, so the writers of those logs don't put them back.
+                        retiredLogIds: [...new Set(retired)].slice(-RETIRED_LOG_HISTORY),
+                        lastCompaction: Date.now()
+                    };
+                },
+                {
+                    verify: (m) => m.snapshotIndexId === newIndexId &&
+                        !filesToDelete.some(id => m.changeLogIds.includes(id))
+                }
+            );
 
-            // 5. Cleanup - Only delete files that were confirmed removed from metadata.
-            // Also delete the old snapshot-data file(s) the old index pointed to (excluding
-            // the freshly-created one, which can't appear here since it's brand new).
+            // 5. Cleanup - ONLY once we have read back the metadata that de-references
+            // these files. Until that write is confirmed, the change logs are still
+            // the only copy of everything in them, and deleting on the strength of an
+            // unverified write is how a lost update turns into lost documents. If the
+            // commit never stuck, the new snapshot files are left behind unreferenced
+            // rather than deleted - a reader may already have picked them up.
+            if (!committed) {
+                this.log('Compaction: metadata never committed, keeping every change log', {
+                    snapshotIndexId: newIndexId,
+                    logs: oldLogIds.length
+                });
+                return;
+            }
+            for (const id of filesToDelete) this.ownLogIds.delete(id);
             const staleDataFileIds = oldDataFileIds.filter(id => id !== dataFileId);
             await this.cleanupOldFiles(oldIndexId, [...filesToDelete, ...staleDataFileIds]);
             this.currentLogSizeEstimate = 0;
@@ -897,29 +1023,185 @@ export class DriveHandler {
         }
     }
 
-    // ... Helpers (atomicUpdateMeta, saveMeta, writeChangeFile same as before) ...
+    // --- _meta.json: the one piece of shared mutable state --------------------
+    //
+    // Drive API v3 has no compare-and-swap. ETags are gone from the API, so the
+    // If-Match header saveMeta() still sends is honoured by the emulated server and
+    // silently ignored by Drive itself - which is what let two clients read the same
+    // metadata, append their own change log, and each write back a changeLogIds list
+    // that did not mention the other's. The losing log stayed in the folder,
+    // referenced by nothing, invisible to every reader.
+    //
+    // Four things stand in for the missing CAS:
+    //
+    //   1. every commit builds on metadata read from Drive moments earlier, never on
+    //      this handler's cached copy, so the window in which a concurrent writer can
+    //      be clobbered is one round trip instead of the client's whole lifetime;
+    //   2. modifiers merge into that copy rather than replacing it, so whatever
+    //      another writer added survives;
+    //   3. commits that matter re-read afterwards and retry if what they wrote is not
+    //      there, which catches the writer who read just before we wrote;
+    //   4. and a writer remembers the logs it wrote (ownLogIds), so anything dropped
+    //      despite all of the above is restored on its next load or commit.
 
-    private async atomicUpdateMeta(modifier: (meta: MetaData) => MetaData): Promise<void> {
-        const MAX_RETRIES = 5;
-        let attempt = 0;
-        while (attempt < MAX_RETRIES) {
-            try {
-                const metaFile = await this.findFile('_meta.json');
-                if (!metaFile) throw new Error('Meta missing');
-                const validMeta = await this.downloadJson(metaFile.fileId, true); // No cache
-                const newMeta = modifier(validMeta);
-                await this.saveMeta(newMeta, metaFile.etag);
-                this.meta = newMeta;
-                return;
-            } catch (err: any) {
-                if (err.status === 412 || err.status === 409) {
-                    attempt++;
-                    await new Promise(r => setTimeout(r, Math.random() * 500 + 100));
-                    continue;
-                }
-                throw err;
-            }
+    /** Run `fn` after every meta mutation this handler has already queued has
+     *  settled. Never call this from inside a commitMeta modifier - it would wait on
+     *  itself. */
+    private withMetaLock<T>(fn: () => Promise<T>): Promise<T> {
+        const run = this.metaLock.then(fn, fn);
+        this.metaLock = run.then(() => undefined, () => undefined);
+        return run;
+    }
+
+    private async backoff(attempt: number): Promise<void> {
+        const ceiling = Math.min(100 * Math.pow(2, attempt), 2000);
+        await new Promise(r => setTimeout(r, ceiling * (0.5 + Math.random())));
+    }
+
+    /** Locate _meta.json and read its body straight from Drive, past every cache. */
+    private async readRemoteMeta(): Promise<{ meta: MetaData; pointer: FilePointer } | null> {
+        const pointer = await this.findFile('_meta.json');
+        if (!pointer) {
+            this.metaFileId = null;
+            return null;
         }
+        this.metaFileId = pointer.fileId;
+        const meta = await this.readMetaBody(pointer.fileId);
+        return meta ? { meta, pointer } : null;
+    }
+
+    /** Read a known _meta.json by id - no folder listing, no cache. Used by the
+     *  post-write verification pass, which only needs the body. */
+    private async readMetaBody(fileId: string): Promise<MetaData | null> {
+        this.fileCache.remove(fileId);
+        const raw = await this.client.getFile(fileId);
+        if (typeof raw === 'string') return JSON.parse(raw) as MetaData;
+        if (raw && typeof raw === 'object') return JSON.parse(JSON.stringify(raw)) as MetaData;
+        return null;
+    }
+
+    private adoptMeta(meta: MetaData, pointer: FilePointer): void {
+        this.meta = meta;
+        this.metaFileId = pointer.fileId;
+        this.metaEtag = pointer.etag || null;
+        this.metaMd5 = pointer.md5Checksum || null;
+        this.metaModifiedTime = pointer.modifiedTime || null;
+    }
+
+    /** True when the folder holds changes this handler has not replayed - another
+     *  writer appended, or compacted, since our last load. */
+    private hasUnprocessedLogs(meta: MetaData): boolean {
+        if (meta.snapshotIndexId !== this.currentSnapshotIndexId) return true;
+        return meta.changeLogIds.some(id => !this.processedLogIds.has(id));
+    }
+
+    /** True when a change log we wrote has fallen out of `changeLogIds` without a
+     *  compaction retiring it - i.e. someone else's write dropped it. */
+    private hasOrphanedOwnLogs(meta: MetaData): boolean {
+        if (this.ownLogIds.size === 0) return false;
+        const present = new Set(meta.changeLogIds);
+        const retired = new Set(meta.retiredLogIds || []);
+        for (const id of this.ownLogIds) {
+            if (!present.has(id) && !retired.has(id)) return true;
+        }
+        return false;
+    }
+
+    /** Put back any such log. Returns `latest` by identity when there is nothing to
+     *  repair, so callers can tell the two cases apart. */
+    private reconcileOwnLogs(latest: MetaData): MetaData {
+        if (this.ownLogIds.size === 0) return latest;
+        const present = new Set(latest.changeLogIds);
+        const retired = new Set(latest.retiredLogIds || []);
+        const missing: string[] = [];
+        for (const id of [...this.ownLogIds]) {
+            if (retired.has(id)) {
+                this.ownLogIds.delete(id); // folded into a snapshot - not ours to defend
+                continue;
+            }
+            if (!present.has(id)) missing.push(id);
+        }
+        if (missing.length === 0) return latest;
+        this.log('Restoring change logs dropped by another writer', missing);
+        return { ...latest, changeLogIds: [...latest.changeLogIds, ...missing] };
+    }
+
+    /**
+     * Read-modify-write `_meta.json`.
+     *
+     * `modify` receives the current remote metadata (with any of our dropped logs
+     * already restored, which `repaired` reports) and returns the value to write, or
+     * null to abandon the commit because its assumptions no longer hold. This method
+     * also returns null when it runs out of attempts. Either way nothing durable has
+     * changed and the caller must not act as though it had.
+     */
+    private commitMeta(
+        modify: (latest: MetaData, repaired: boolean) => MetaData | null,
+        opts: { verify?: (committed: MetaData) => boolean } = {}
+    ): Promise<MetaData | null> {
+        return this.withMetaLock(async () => {
+            for (let attempt = 0; attempt < META_COMMIT_RETRIES; attempt++) {
+                const current = await this.readRemoteMeta();
+                if (!current) throw new Error('Meta missing');
+
+                const reconciled = this.reconcileOwnLogs(current.meta);
+                const next = modify(reconciled, reconciled !== current.meta);
+                if (!next) return null;
+
+                try {
+                    await this.saveMeta(next, current.pointer);
+                } catch (err: any) {
+                    if (err.status === 412 || err.status === 409) {
+                        await this.backoff(attempt);
+                        continue;
+                    }
+                    throw err;
+                }
+
+                if (!opts.verify) {
+                    this.meta = next;
+                    return next;
+                }
+
+                const after = await this.readMetaBody(current.pointer.fileId);
+                if (after && opts.verify(after)) {
+                    // Adopt the remote view rather than our own - it carries whatever
+                    // else landed alongside us.
+                    this.meta = after;
+                    return after;
+                }
+                this.log('Meta commit did not survive, retrying', { attempt });
+                await this.backoff(attempt);
+            }
+            this.log('Meta commit abandoned after', META_COMMIT_RETRIES, 'attempts');
+            return null;
+        });
+    }
+
+    /** Create _meta.json for a folder that has none. Two clients opening the same
+     *  empty folder both end up here and Drive will happily keep two files with the
+     *  same name, after which every client picks between them at random. Settle it
+     *  deterministically instead: lowest file id wins, the loser deletes its own and
+     *  adopts the winner. */
+    private async ensureMetaFile(): Promise<void> {
+        await this.saveMeta(this.meta, null);
+        const mine = this.metaFileId;
+        const rivals = await this.findFiles('_meta.json');
+        if (rivals.length < 2 || !mine) return;
+
+        const winner = rivals.map(f => f.fileId).sort()[0];
+        if (winner === mine) {
+            this.log('Won the _meta.json creation race', { mine, rivals: rivals.length });
+            return;
+        }
+        this.log('Lost the _meta.json creation race, adopting', winner);
+        try {
+            await this.client.deleteFile(mine);
+        } catch (e) {
+            this.log('Failed to remove duplicate _meta.json', mine, e);
+        }
+        const adopted = await this.readRemoteMeta();
+        if (adopted) this.adoptMeta(adopted.meta, adopted.pointer);
     }
 
     // Reused helpers
@@ -936,6 +1218,20 @@ export class DriveHandler {
             ''
         );
         return createRes.id;
+    }
+
+    /** Every file in the folder with this name. Drive allows duplicates, so this is
+     *  how the callers that care (see ensureMetaFile) find out there are any. */
+    private async findFiles(name: string): Promise<FilePointer[]> {
+        const safeName = this.escapeQuery(name);
+        const q = `name = '${safeName}' and '${this.folderId}' in parents and trashed = false`;
+        const files = await this.client.listFiles(q);
+        return files.map(file => ({
+            fileId: file.id,
+            etag: file.etag,
+            md5Checksum: (file as any).md5Checksum,
+            modifiedTime: file.modifiedTime
+        } as FilePointer));
     }
 
     private async findFile(name: string): Promise<FilePointer | null> {
@@ -976,7 +1272,9 @@ export class DriveHandler {
     private async writeChangeFile(changes: ChangeEntry[]): Promise<string> {
         const lines = changes.map(c => JSON.stringify(c)).join('\n') + '\n';
         const startSeq = changes[0].seq;
-        const name = `changes-${startSeq}-${Math.random().toString(36).substring(7)}.ndjson`;
+        // The writer id makes the name unique even when two clients do manage to
+        // stamp the same starting sequence number, and says who wrote it.
+        const name = `changes-${startSeq}-${this.writerId}-${Math.random().toString(36).substring(7)}.ndjson`;
 
         const res = await this.client.createFile(
             name,
@@ -989,18 +1287,26 @@ export class DriveHandler {
         return res.id;
     }
 
-    private async saveMeta(meta: MetaData, expectedEtag: string | null = null): Promise<void> {
+    /** Write `meta` to _meta.json. `target` is the file to write, as already
+     *  located by the caller; pass null to force creation, or omit it to look the
+     *  file up. */
+    private async saveMeta(meta: MetaData, target?: FilePointer | null): Promise<void> {
         const content = JSON.stringify(meta);
-        const metaFile = await this.findFile('_meta.json');
+        const metaFile = target !== undefined ? target : await this.findFile('_meta.json');
 
         if (metaFile) {
-            const res = await this.client.updateFile(metaFile.fileId, content, expectedEtag || undefined);
+            // If-Match is a no-op against Drive v3, which dropped ETags - it still
+            // guards the emulated server and costs nothing, but nothing here may
+            // assume it was enforced. See the commitMeta block above.
+            const res = await this.client.updateFile(metaFile.fileId, content, metaFile.etag || undefined);
+            this.metaFileId = metaFile.fileId;
             this.metaEtag = res.etag;
             this.metaMd5 = (res as any).md5Checksum || null;
             this.metaModifiedTime = res.modifiedTime;
             this.fileCache.remove(metaFile.fileId); // Invalidate cache
         } else {
             const res = await this.client.createFile('_meta.json', [this.folderId!], 'application/json', content);
+            this.metaFileId = res.id;
             this.metaEtag = res.etag;
             this.metaMd5 = (res as any).md5Checksum || null;
             this.metaModifiedTime = res.modifiedTime;
@@ -1047,13 +1353,27 @@ export class DriveHandler {
         }
     }
 
+    /**
+     * Watch _meta.json for writes by other clients.
+     *
+     * This is the only thing that makes `db.changes({ live: true })` fire for a
+     * *remote* write: on a change it calls load(), which replays the newly
+     * referenced logs and emits exactly those through notifyListeners. Without it a
+     * client only ever hears about what it wrote itself, so connect-and-read works
+     * and continuous sync between two connected clients does not.
+     *
+     * Change is detected by md5Checksum, falling back to modifiedTime. There is
+     * deliberately no ETag comparison: Drive API v3 has none (see
+     * docs/adr/0001-metadata-writes-without-compare-and-swap.md), so that branch
+     * could only ever compare '' against '' - and sitting first in the chain, it
+     * shadowed the two comparisons that do work.
+     */
     private startPolling(intervalMs: number): void {
-        this.log('Starting polling with interval', { intervalMs });
         if (isNaN(intervalMs) || intervalMs <= 0) return;
-        if (this.pollingInterval) clearInterval(this.pollingInterval);
+        if (this.pollingInterval) return; // already watching
+        this.log('Starting polling with interval', { intervalMs });
 
         this.pollingInterval = setInterval(async () => {
-            this.log('Polling tick...');
             if (this.isPollingActive) {
                 this.log('Polling already in progress, skipping tick');
                 return;
@@ -1066,26 +1386,17 @@ export class DriveHandler {
                     return;
                 }
 
-                // Compare etags, falling back to md5Checksum or modifiedTime
-                const remoteEtag = metaFile.etag;
                 const remoteMd5 = metaFile.md5Checksum;
                 const remoteModified = metaFile.modifiedTime;
-
-                this.log('Polling: comparing etag', remoteEtag, 'with', this.metaEtag, 'md5', remoteMd5, 'with', this.metaMd5);
-
-                let changed = false;
-                if (remoteEtag && this.metaEtag) {
-                    if (remoteEtag !== this.metaEtag) changed = true;
-                } else if (remoteMd5 && this.metaMd5) {
-                    if (remoteMd5 !== this.metaMd5) changed = true;
-                } else if (remoteModified !== this.metaModifiedTime) {
-                    changed = true;
-                }
+                const changed = remoteMd5 && this.metaMd5
+                    ? remoteMd5 !== this.metaMd5
+                    : remoteModified !== this.metaModifiedTime;
 
                 if (changed) {
-                    this.log('Polling detected change!', remoteEtag || remoteMd5 || remoteModified);
+                    this.log('Polling detected change', { remoteMd5, remoteModified });
+                    // load() emits precisely what it replayed. Announcing the whole
+                    // index instead is what used to send PouchDB sync in circles.
                     await this.load();
-                    this.notifyListeners();
                 }
             } catch (err) {
                 this.log('Polling error', err);

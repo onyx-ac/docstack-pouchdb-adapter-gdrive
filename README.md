@@ -6,7 +6,7 @@ A persistent, serverless PouchDB adapter that uses Google Drive as a backend sto
 
 - **🚀 Append-Only Log**: Uses an efficient append-only log pattern for fast, conflict-free writes.
 - **⚡ Lazy Loading**: Optimizes memory and bandwidth by loading only the **Index** into memory. Document bodies are fetched on-demand.
-- **🛡️ Optimistic Concurrency Control**: Uses ETag-based locking on metadata to prevent race conditions.
+- **🛡️ Multi-writer safe**: Metadata writes merge rather than replace, and are read back before anything is deleted. See [Concurrent writers](#concurrent-writers).
 - **📦 Auto-Compaction**: Automatically merges logs for performance.
 - **🌍 Universal**: Works natively in Node.js 18+, Browsers, and Edge environments (no `googleapis` dependency).
 
@@ -59,6 +59,57 @@ const adapterPlugin = GoogleDriveAdapter({
   folderName: 'my-app-db'
 });
 ```
+
+### Live changes from other clients
+
+Set `pollingIntervalMs` to have the adapter watch `_meta.json` and replay what other
+clients write. Without it, a client only hears about its own writes — connect-and-read
+works, continuous sync between two connected clients does not.
+
+```typescript
+const adapterPlugin = GoogleDriveAdapter({
+  accessToken: 'YOUR_GOOGLE_ACCESS_TOKEN',
+  folderId: 'my-folder-id',
+  pollingIntervalMs: 2000  // check for remote writes every 2s
+});
+
+db.changes({ live: true, since: 'now' }).on('change', change => { /* ... */ });
+```
+
+A tick costs one `files.list`, whatever has changed; only a tick that sees a new
+`md5Checksum` (or, failing that, a new `modifiedTime`) goes on to fetch anything.
+`db.close()` and `db.destroy()` stop it.
+
+## Concurrent writers
+
+Several clients may share one folder. What that costs, and what it does not:
+
+- **Writes from different clients do not overwrite each other.** `_meta.json` is the
+  only shared mutable state. Every write to it is built on a copy read from Drive
+  moments earlier, merges into that copy instead of replacing it, and is read back
+  afterwards to confirm it survived. A writer also remembers the change logs it
+  wrote and restores any that go missing on its next load.
+- **Compaction deletes nothing until its metadata write is confirmed.** Until then,
+  the change logs are still the only copy of the changes in them.
+- **Sequence numbers come from Drive, not from a local counter**, so two clients
+  writing minutes apart cannot mint the same one.
+- **A writer catches up before it writes**, so it sees what its peers have appended.
+  A client that only *reads* needs `pollingIntervalMs` to notice anything.
+
+Caveats worth knowing before you fan out:
+
+- **There is no compare-and-swap.** Drive API v3 dropped ETags, so `If-Match` is
+  accepted and ignored - the adapter still sends it (the emulated test server does
+  enforce it), but nothing may assume it was honoured. Two clients writing metadata
+  within the same round trip can still produce a lost update; the read-back and the
+  restore-on-load above are what repair it, so a client that writes and immediately
+  disconnects forever is the one case that can leave a change log unreferenced.
+- **Pass `folderId`, not just `folderName`, when several clients may start at once.**
+  Duplicate `_meta.json` files are detected and resolved; duplicate *folders* are
+  not, and two clients that each create "my-app-db-folder" get two databases.
+- **A document written concurrently by two clients resolves last-writer-wins in the
+  index**, not through pouchdb-merge. Both revisions stay on Drive, but the losing
+  one will not show up as a conflict branch.
 
 ## Architecture
 

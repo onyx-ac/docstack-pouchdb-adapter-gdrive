@@ -134,7 +134,7 @@ export class GoogleDriveClient {
         };
     }
 
-    async createFile(name: string, parents: string[] | undefined, mimeType: string, content: string): Promise<{ id: string, etag: string, modifiedTime: string }> {
+    async createFile(name: string, parents: string[] | undefined, mimeType: string, content: string): Promise<{ id: string, etag: string, modifiedTime: string, md5Checksum?: string }> {
         const metadata = {
             name,
             mimeType,
@@ -158,7 +158,7 @@ export class GoogleDriveClient {
 
         const multipartBody = this.buildMultipart(metadata, content, mimeType);
 
-        const res = await this.fetch(`${this.uploadUrl}?uploadType=multipart&fields=id,modifiedTime`, {
+        const res = await this.fetch(`${this.uploadUrl}?uploadType=multipart&fields=id,modifiedTime,md5Checksum`, {
             method: 'POST',
             headers: {
                 'Content-Type': `multipart/related; boundary=${multipartBody.boundary}`
@@ -169,14 +169,15 @@ export class GoogleDriveClient {
         return {
             id: data.id,
             etag: this.extractEtag(res, data),
-            modifiedTime: data.modifiedTime || res.headers.get('Last-Modified') || ''
+            modifiedTime: data.modifiedTime || res.headers.get('Last-Modified') || '',
+            md5Checksum: data.md5Checksum
         };
     }
 
-    async updateFile(fileId: string, content: string, expectedEtag?: string): Promise<{ id: string, etag: string, modifiedTime: string }> {
+    async updateFile(fileId: string, content: string, expectedEtag?: string): Promise<{ id: string, etag: string, modifiedTime: string, md5Checksum?: string }> {
         // Update content (media) usually, but sometimes meta?
         // In our usage (saveMeta), we update body.
-        const res = await this.fetch(`${this.uploadUrl}/${fileId}?uploadType=media&fields=id,modifiedTime`, {
+        const res = await this.fetch(`${this.uploadUrl}/${fileId}?uploadType=media&fields=id,modifiedTime,md5Checksum`, {
             method: 'PATCH',
             headers: expectedEtag ? { 'If-Match': `"${expectedEtag}"`, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' },
             body: content
@@ -185,7 +186,8 @@ export class GoogleDriveClient {
         return {
             id: data.id,
             etag: this.extractEtag(res, data),
-            modifiedTime: data.modifiedTime || res.headers.get('Last-Modified') || ''
+            modifiedTime: data.modifiedTime || res.headers.get('Last-Modified') || '',
+            md5Checksum: data.md5Checksum
         };
     }
 

@@ -118,6 +118,13 @@ export interface MetaData {
     seq: number;
     /** List of active change log file IDs */
     changeLogIds: string[];
+    /** Change logs a compaction has folded into the snapshot and deleted.
+     *  Tombstones: without them a writer that still remembers writing one of these
+     *  would keep putting it back (see DriveHandler.reconcileOwnLogs). Capped at
+     *  RETIRED_LOG_HISTORY entries - a writer that slept through more compactions
+     *  than that may resurrect a dead file id, which replays as a skipped 404 and is
+     *  pruned by the next compaction. */
+    retiredLogIds?: string[];
     /** Snapshot Index file ID */
     snapshotIndexId: string | null;
     /** Last compaction timestamp */
