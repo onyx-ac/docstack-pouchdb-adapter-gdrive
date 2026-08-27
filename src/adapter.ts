@@ -616,29 +616,47 @@ export function GoogleDriveAdapter(PouchDB: any) {
                 log('_changes setting up live listener');
                 liveListener = (changedDocs: Record<string, any>) => {
                     if (complete) return;
-                    for (const id of Object.keys(changedDocs)) {
-                        if (id.startsWith('_local/')) continue;
-                        const entry = db.getIndexEntry(id);
-                        if (entry && entry.seq > lastSeq) {
+
+                    // Gate the whole batch against where the feed stood BEFORE it,
+                    // then emit in seq order and advance once at the end. The old
+                    // shape - unordered iteration, lastSeq bumped per emission - is
+                    // the initial pass's bug in another spot (its own comment: "an
+                    // unordered batch can checkpoint past a change it never
+                    // emitted"): a higher-seq doc processed first raised the bar,
+                    // and a lower-seq sibling in the same batch failed `> lastSeq`
+                    // and was never delivered, while the checkpoint moved past it.
+                    const gate = lastSeq;
+                    const batch = Object.keys(changedDocs)
+                        .filter(id => !id.startsWith('_local/'))
+                        .map(id => ({ id, entry: db.getIndexEntry(id) }))
+                        .filter((row): row is { id: string; entry: NonNullable<ReturnType<typeof db.getIndexEntry>> } =>
+                            Boolean(row.entry) && row.entry!.seq > gate)
+                        .sort((a, b) => a.entry.seq - b.entry.seq);
+                    if (batch.length === 0) return;
+
+                    const emit = (bodies: Record<string, any> | null) => {
+                        for (const { id, entry } of batch) {
                             const change: any = {
-                                id: id,
+                                id,
                                 seq: entry.seq,
                                 changes: buildChangesList(entry, opts.style)
                             };
-
-                            if (opts.include_docs) {
-                                // Same tombstone rule as the initial pass: a `null` body
-                                // makes a filtered replication drop the deletion.
-                                loadChangeBodies([{ id, entry }]).then(bodies => {
-                                    change.doc = bodies[id];
-                                    if (opts.onChange) opts.onChange(change);
-                                    lastSeq = Math.max(lastSeq, change.seq);
-                                }).catch(e => log('Live change body fetch error', e));
-                            } else {
-                                if (opts.onChange) opts.onChange(change);
-                                lastSeq = Math.max(lastSeq, change.seq);
-                            }
+                            // Same tombstone rule as the initial pass: a `null` body
+                            // makes a filtered replication drop the deletion.
+                            if (bodies) change.doc = bodies[id];
+                            if (opts.onChange) opts.onChange(change);
+                            lastSeq = Math.max(lastSeq, entry.seq);
                         }
+                    };
+
+                    if (opts.include_docs) {
+                        // Bodies for the whole batch first, then emit in order -
+                        // per-row fetches resolved in whatever order the network
+                        // chose, which reordered emissions and raced the gate.
+                        loadChangeBodies(batch).then(emit)
+                            .catch(e => log('Live change body fetch error', e));
+                    } else {
+                        emit(null);
                     }
                 };
                 cancelLive = db.onChange(liveListener);

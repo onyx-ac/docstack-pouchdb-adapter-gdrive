@@ -29,6 +29,12 @@ export class FakeDrive {
     latencyMs = 0;
     /** File id whose writes are accepted and thrown away - a lost update. */
     swallowWritesTo: string | null = null;
+    /** File ids whose next content download fails once - the shape of a change-log
+     *  GET clipped by Drive's rate limiter during a bursty load(). */
+    failNextDownloadOf: Set<string> = new Set();
+    /** Peak number of content downloads in flight at once - what a rate limiter sees. */
+    maxConcurrentDownloads = 0;
+    private inFlightDownloads = 0;
     private counter = 0;
 
     reset() {
@@ -37,6 +43,9 @@ export class FakeDrive {
         this.jitter = false;
         this.severed = false;
         this.swallowWritesTo = null;
+        this.failNextDownloadOf = new Set();
+        this.maxConcurrentDownloads = 0;
+        this.inFlightDownloads = 0;
         this.counter = 0;
     }
 
@@ -188,10 +197,19 @@ export class FakeDrive {
                     .map(strip);
             }),
             getFile: jest.fn(async (fileId: string) => {
-                await drive.tick();
-                const file = drive.files.get(fileId);
-                if (!file) throw Object.assign(new Error('Not found'), { status: 404 });
-                return file.content;
+                drive.inFlightDownloads++;
+                drive.maxConcurrentDownloads = Math.max(drive.maxConcurrentDownloads, drive.inFlightDownloads);
+                try {
+                    await drive.tick();
+                    if (drive.failNextDownloadOf.delete(fileId)) {
+                        throw Object.assign(new Error('Rate limit exceeded'), { status: 429 });
+                    }
+                    const file = drive.files.get(fileId);
+                    if (!file) throw Object.assign(new Error('Not found'), { status: 404 });
+                    return file.content;
+                } finally {
+                    drive.inFlightDownloads--;
+                }
             }),
             getFileMetadata: jest.fn(async (fileId: string) => {
                 await drive.tick();

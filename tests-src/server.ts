@@ -93,6 +93,13 @@ export class TestServer {
                 files = files.filter(f => f.name === name);
             }
 
+            // Prefix filter - how change logs are discovered
+            const containsMatch = dq.match(/name contains '([^']+)'/);
+            if (containsMatch) {
+                const needle = containsMatch[1];
+                files = files.filter(f => typeof f.name === 'string' && f.name.includes(needle));
+            }
+
             // Parent filter
             const parentMatch = q.match(/'([^']+)' in parents/);
             if (parentMatch) {

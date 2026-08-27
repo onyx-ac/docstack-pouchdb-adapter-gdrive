@@ -1,6 +1,6 @@
 {
   "name": "@docstack/pouchdb-adapter-googledrive",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "PouchDB adapter for Google Drive",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -9,7 +9,8 @@
     "test": "jest",
     "test:prod": "TEST_ENV=production jest",
     "test:prod:explore": "TEST_ENV=production jest tests/production.explore.test.ts",
-    "test:prod:replication": "TEST_ENV=production jest tests/production.replication.test.ts"
+    "test:prod:replication": "TEST_ENV=production jest tests/production.replication.test.ts",
+    "test:prod:concurrency": "TEST_ENV=production jest tests/production.concurrency.test.ts"
   },
   "keywords": [
     "pouchdb",

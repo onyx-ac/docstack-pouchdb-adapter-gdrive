@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.7 — unreleased
+
+### Fixed
+
+- **A re-replayed old change log no longer regresses the reader's index.** A log
+  download clipped by the rate limiter was retried on a later load — after higher
+  logs had applied — and the replay path replaced index entries blindly, rewriting
+  rev/seq/location to older state. The regressed entry then failed the changes
+  feed's gate, the newer revision was never emitted, and the puller's checkpoint
+  sealed the loss: both devices idle and up to date while holding different data.
+  Replay now merges into the existing entry and never moves a document backwards;
+  winners are decided by revision generation (a stale revision echoed at a fresh
+  sequence number loses too), and losing revisions stay reachable as conflicts.
+  Field report and reasoning: ADR-0004 / finding 0006, in the repository.
+
+- **Cold-boot change-log downloads are bounded to 8 in flight**, not one burst of
+  everything pending — the burst was what invited the rate limiting that created
+  out-of-order retries in the first place.
+
+- **The live changes listener emits each batch in sequence order** and advances its
+  checkpoint as it emits, instead of gating each document against a bar that other
+  documents in the same batch had already raised — the initial pass's own fix,
+  applied to the listener.
+
+### Added
+
+- `tests/production.concurrency.test.ts` (`npm run test:prod:concurrency`) —
+  re-checks the multi-writer invariants (no orphaned logs, no duplicate sequence
+  numbers, lost metadata updates cost nothing, acknowledged writes readable) against
+  the real Drive API rather than the test fake.
+
+
 ## 0.1.6 — 2026-08-27
 
 A data-loss fix. Every client sharing a folder should be upgraded together; see

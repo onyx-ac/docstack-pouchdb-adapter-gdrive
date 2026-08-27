@@ -10,12 +10,16 @@ import {
 } from './types';
 import { LRUCache } from './cache';
 import { GoogleDriveClient } from './client';
+import { merge, revExists } from 'pouchdb-merge';
+import type { RevTree, RevTreePath } from 'pouchdb-merge';
 
 const DEFAULT_COMPACTION_THRESHOLD = 100; // entries
 const DEFAULT_SIZE_THRESHOLD = 1024 * 1024; // 1MB
 const DEFAULT_CACHE_SIZE = 1000; // Number of docs
 const META_COMMIT_RETRIES = 6; // read-modify-write attempts per _meta.json commit
 const RETIRED_LOG_HISTORY = 500; // tombstones kept for change logs compaction deleted
+const LOG_DOWNLOAD_CONCURRENCY = 8; // parallel change-log GETs during load()
+const MERGE_DEPTH = 1000; // revs_limit for index-side tree merges
 
 /**
  * Sequence numbers are `tick * SEQ_SLOTS + writerSlot`.
@@ -295,8 +299,14 @@ export class DriveHandler {
                     .filter(id => !this.processedLogIds.has(id) && !retired.has(id));
 
                 if (pendingLogs.length > 0) {
-                    this.log(`Downloading ${pendingLogs.length} change logs in parallel`);
-                    const logResults = await Promise.all(pendingLogs.map(async (id) => {
+                    this.log(`Downloading ${pendingLogs.length} change logs, ${LOG_DOWNLOAD_CONCURRENCY} at a time`);
+                    // Bounded, not unbounded: a cold boot can hold dozens of pending
+                    // logs, and firing them all at once is exactly the burst Drive's
+                    // rate limiter clips. A clipped download is skipped and retried on
+                    // a later load - out of order, which used to regress the index
+                    // (see updateIndex); the guard there is the fix, this is the
+                    // prevention.
+                    const logResults = await this.mapBounded(pendingLogs, LOG_DOWNLOAD_CONCURRENCY, async (id) => {
                         try {
                             const changes = await this.downloadNdjson(id);
                             return { id, changes };
@@ -304,7 +314,7 @@ export class DriveHandler {
                             this.log(`Failed to download change log ${id}`, e);
                             return { id, changes: null };
                         }
-                    }));
+                    });
 
                     // Replay in sequence order, not in the order the ids happened to
                     // be listed. Two clients can hold different changeLogIds orderings
@@ -924,17 +934,97 @@ export class DriveHandler {
             return;
         }
 
-        // Legacy path: no computed tree (the low-level DriveHandler.appendChange()
-        // API's raw callers - e.g. concurrency tests - never set nextIndexEntry).
-        // Synthesize a trivial single-node tree so the index entry shape stays
-        // consistent for anything reading `.tree` (e.g. _getRevisionTree).
-        this.index[change.id] = {
-            tree: synthesizeTree(change.rev, change.deleted),
-            rev: change.rev,
-            seq: change.seq,
-            deleted: !!change.deleted,
-            location: { fileId }
+        // Legacy path: no computed tree. Every row a reader replays lands here,
+        // because `nextIndexEntry` is stripped before upload - which makes this the
+        // path that decides what a replica believes.
+        //
+        // It used to replace the entry blindly, and a row replayed out of order
+        // rewrote rev, seq and location to an older state. Out-of-order replay is
+        // routine, not exotic: a change-log download clipped by the rate limiter is
+        // skipped and retried on a later load, after higher logs have applied. The
+        // regressed entry then fails the changes feed's `seq > since` gate, so the
+        // newer revision is never emitted, and the puller's checkpoint advances past
+        // it - silent, permanent loss on the reading side while the folder holds
+        // everything. A writer echoing a stale revision at a fresh seq regressed the
+        // winner the same way, no retry needed.
+        //
+        // So: merge instead of replace, and never let a replay move a document
+        // backwards. The winner is decided by revision generation (hash tie-break),
+        // not pouchdb-merge's winningRev - synthesized nodes carry no ancestry, so
+        // every rev is a leaf to winningRev, and its live-leaf preference would let
+        // an old live rev beat a genuine deletion at a higher generation.
+        const existing = this.index[change.id];
+        if (!existing) {
+            this.index[change.id] = {
+                tree: synthesizeTree(change.rev, change.deleted),
+                rev: change.rev,
+                seq: change.seq,
+                deleted: !!change.deleted,
+                location: { fileId }
+            };
+            return;
+        }
+
+        // Never regress the seq, whatever else happens - the feed gates on it.
+        const seq = Math.max(existing.seq, change.seq);
+
+        let existingTree: RevTree;
+        try {
+            existingTree = JSON.parse(existing.tree) as RevTree;
+        } catch {
+            existingTree = JSON.parse(synthesizeTree(existing.rev, existing.deleted)) as RevTree;
+        }
+
+        if (change.rev === existing.rev || revExists(existingTree, change.rev)) {
+            // A re-replay of something already known: nothing to change but the seq.
+            if (seq !== existing.seq) this.index[change.id] = { ...existing, seq };
+            return;
+        }
+
+        const incomingPath = (JSON.parse(synthesizeTree(change.rev, change.deleted)) as RevTree)[0] as RevTreePath;
+        const mergedTree = merge(existingTree, incomingPath, MERGE_DEPTH).tree;
+
+        const genOf = (rev: string) => parseInt(rev.split('-')[0], 10) || 0;
+        const hashOf = (rev: string) => rev.slice(rev.indexOf('-') + 1);
+        const incomingWins = genOf(change.rev) !== genOf(existing.rev)
+            ? genOf(change.rev) > genOf(existing.rev)
+            : hashOf(change.rev) > hashOf(existing.rev); // CouchDB's deterministic tie-break
+
+        const entry: IndexEntry = {
+            tree: JSON.stringify(mergedTree),
+            rev: incomingWins ? change.rev : existing.rev,
+            seq,
+            deleted: incomingWins ? !!change.deleted : !!existing.deleted,
+            location: incomingWins ? { fileId } : existing.location
         };
+
+        // The losing revision stays reachable as a conflict, matching what the
+        // nextIndexEntry path does for real merges.
+        const conflicts: Record<string, FilePointer> = { ...(existing.conflictLocations || {}) };
+        if (incomingWins) {
+            conflicts[existing.rev] = existing.location;
+        } else {
+            conflicts[change.rev] = { fileId };
+        }
+        delete conflicts[entry.rev];
+        if (Object.keys(conflicts).length > 0) entry.conflictLocations = conflicts;
+
+        this.index[change.id] = entry;
+    }
+
+    /** Run `fn` over `items` with at most `limit` in flight at once, preserving
+     *  result order. */
+    private async mapBounded<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+        const results: R[] = new Array(items.length);
+        let next = 0;
+        const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+            while (next < items.length) {
+                const i = next++;
+                results[i] = await fn(items[i]);
+            }
+        });
+        await Promise.all(workers);
+        return results;
     }
 
     private checkConflicts(changes: ChangeEntry[]): void {
