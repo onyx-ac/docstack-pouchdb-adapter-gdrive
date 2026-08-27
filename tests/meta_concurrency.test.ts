@@ -69,10 +69,14 @@ describe('Shared _meta.json without compare-and-swap', () => {
         await a.appendChange(change('doc-a', '1-a'));
         await b.appendChange(change('doc-b', '1-b'));
 
+        // Sequence numbers are no longer dense: the low digits carry a per-writer
+        // slot, so two clients can share a tick without sharing a number. What has to
+        // hold is uniqueness and order, not that they count 1, 2, 3.
         const seqs = drive.changeLogs().flatMap(f => drive.entriesIn(f)).map(c => c.seq);
-        expect(seqs.slice().sort()).toEqual([1, 2]);
-        expect(new Set(seqs).size).toBe(seqs.length);
-        expect(drive.meta().seq).toBe(2);
+        expect(seqs).toHaveLength(2);
+        expect(new Set(seqs).size).toBe(2);
+        expect(drive.duplicateSeqs()).toEqual([]);
+        expect(drive.meta().seq).toBe(Math.max(...seqs));
     });
 
     it('restores a change log that another writer dropped', async () => {
@@ -95,6 +99,30 @@ describe('Shared _meta.json without compare-and-swap', () => {
         const reader = handler('client-c');
         await reader.load();
         expect(await reader.get('doc-a')).toMatchObject({ _id: 'doc-a' });
+    });
+
+    it('a reader finds an orphaned log the writer never came back to repair', async () => {
+        const a = handler('client-a');
+        await a.load();
+        await a.appendChange(change('doc-a', '1-a'));
+
+        const logId = drive.meta().changeLogIds[0];
+
+        // The clobber lands *after* A's commit was written and read back, so none of
+        // A's own guards can see it - and A never runs again, which is what the end
+        // of a browser session looks like. Nothing references A's log any more.
+        drive.writeMeta({ ...drive.meta(), changeLogIds: [] });
+
+        // A reader that has never heard of this log has to find it anyway. The
+        // folder is the authority on which change logs exist; the metadata is only a
+        // cache of that, and this is the case where the cache is wrong.
+        const reader = handler('client-c');
+        await reader.load();
+
+        expect(await reader.get('doc-a')).toMatchObject({ _id: 'doc-a' });
+        // ...and repairs the metadata on everyone's behalf, not just its own.
+        expect(drive.meta().changeLogIds).toContain(logId);
+        expect(drive.orphanedLogs()).toEqual([]);
     });
 
     it('leaves a retired change log retired', async () => {

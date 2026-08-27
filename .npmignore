@@ -9,6 +9,7 @@ tests/
 tests-src/
 *.txt
 .env
+.env.example
 .test-drive-*
 *.log
 docs/

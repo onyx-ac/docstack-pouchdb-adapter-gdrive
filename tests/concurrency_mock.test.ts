@@ -107,7 +107,14 @@ describe('Concurrency & Race Conditions', () => {
 
         expect(doc1).toBeDefined();
         expect(doc2).toBeDefined();
-        expect(driveHandler1.seq).toBe(2);
+
+        // Sequence numbers carry a per-writer slot in their low digits, so they are no
+        // longer dense and "the second write got 2" is not a property any more. What
+        // has to hold is that two writers never landed on the same number.
+        const seq1 = driveHandler1.getIndexEntry('doc1')!.seq;
+        const seq2 = driveHandler1.getIndexEntry('doc2')!.seq;
+        expect(seq1).not.toBe(seq2);
+        expect(driveHandler1.seq).toBeGreaterThanOrEqual(Math.max(seq1, seq2));
     });
 
     it('should detect conflicting updates', async () => {

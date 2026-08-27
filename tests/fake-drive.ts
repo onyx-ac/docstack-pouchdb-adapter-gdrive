@@ -34,6 +34,8 @@ export class FakeDrive {
     reset() {
         this.files.clear();
         this.latencyMs = 0;
+        this.jitter = false;
+        this.severed = false;
         this.swallowWritesTo = null;
         this.counter = 0;
     }
@@ -47,10 +49,25 @@ export class FakeDrive {
         return id;
     }
 
+    /** Give every call a random slice of latencyMs instead of all of it. Real
+     *  networks do not deliver every round trip in the same time, and uniform latency
+     *  explores a far narrower set of interleavings than jittered latency does. */
+    jitter = false;
+
+    /** Calls that reject with this once armed - standing in for a browser context
+     *  that goes away mid-write. */
+    private severed = false;
+
+    /** Stop answering, the way a closed tab stops answering. */
+    sever() { this.severed = true; }
+
     private tick() {
-        return this.latencyMs > 0
-            ? new Promise(r => setTimeout(r, this.latencyMs))
-            : Promise.resolve();
+        if (this.severed) {
+            return Promise.reject(Object.assign(new Error('Network Error: context gone'), { code: 'network_error' }));
+        }
+        if (this.latencyMs <= 0) return Promise.resolve();
+        const ms = this.jitter ? Math.random() * this.latencyMs : this.latencyMs;
+        return new Promise(r => setTimeout(r, ms));
     }
 
     private nextId() {
@@ -88,6 +105,57 @@ export class FakeDrive {
         return file.content.split('\n').filter(l => l.trim()).map(l => JSON.parse(l));
     }
 
+    /**
+     * Why a document might be unreadable. The two failures look identical from the
+     * outside and have opposite causes:
+     *
+     *   - **orphaned**: the file is in the folder, nothing references it.
+     *   - **dangling**: _meta.json references a file that is not in the folder.
+     *     load() logs the failed download and moves on, so this one leaves no
+     *     evidence in the folder at all.
+     */
+    diagnose(docId: string) {
+        const meta = this.meta();
+        const referenced = new Set(meta.changeLogIds);
+        const present = new Map(this.changeLogs().map(f => [f.id, f]));
+
+        const dangling = meta.changeLogIds.filter(id => !present.has(id));
+        const orphaned = [...present.values()].filter(f => !referenced.has(f.id));
+        const holding = [...present.values()]
+            .filter(f => this.entriesIn(f).some(c => c.id === docId))
+            .map(f => ({ name: f.name, referenced: referenced.has(f.id) }));
+
+        return {
+            docId,
+            metaSeq: meta.seq,
+            referencedCount: meta.changeLogIds.length,
+            presentCount: present.size,
+            danglingReferences: dangling,
+            orphanedLogs: orphaned.map(f => f.name),
+            logsHoldingDoc: holding,
+            verdict: holding.length === 0
+                ? (dangling.length > 0 ? 'DANGLING - its log was deleted after being referenced' : 'GONE - no surviving log holds it')
+                : holding.some(h => h.referenced) ? 'READABLE - present and referenced' : 'ORPHANED - present, unreferenced'
+        };
+    }
+
+    /** Every sequence number in the folder, with the logs that minted it. A
+     *  sequence number claimed twice is what stops a replication target from ever
+     *  seeing the second document: `_changes` filters on `seq > since`. */
+    duplicateSeqs(): Array<{ seq: number; logs: string[] }> {
+        const bySeq = new Map<number, string[]>();
+        for (const file of this.changeLogs()) {
+            for (const entry of this.entriesIn(file)) {
+                const logs = bySeq.get(entry.seq) || [];
+                if (!logs.includes(file.name)) logs.push(file.name);
+                bySeq.set(entry.seq, logs);
+            }
+        }
+        return [...bySeq.entries()]
+            .filter(([, logs]) => logs.length > 1)
+            .map(([seq, logs]) => ({ seq, logs }));
+    }
+
     /** Every change log in the folder is reachable from _meta.json. */
     orphanedLogs(): string[] {
         const referenced = new Set(this.meta().changeLogIds);
@@ -111,9 +179,11 @@ export class FakeDrive {
             listFiles: jest.fn(async (q: string) => {
                 await drive.tick();
                 const name = q.match(/name = '([^']+)'/);
+                const contains = q.match(/name contains '([^']+)'/);
                 const parent = q.match(/'([^']+)' in parents/);
                 return [...drive.files.values()]
                     .filter(f => !name || f.name === name[1])
+                    .filter(f => !contains || f.name.includes(contains[1]))
                     .filter(f => !parent || f.parents.includes(parent[1]))
                     .map(strip);
             }),

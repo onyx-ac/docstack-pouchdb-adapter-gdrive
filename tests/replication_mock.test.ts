@@ -108,23 +108,31 @@ describe('Replication Compatibility', () => {
 
     it('should support incremental updates via _changes', (done) => {
         // 1. Put doc1
-        adapter._bulkDocs({ docs: [{ _id: 'doc1', val: 1 }] }, {}, (err: any, res: any) => {
-            const rev1 = res[0].rev;
-            const seq1 = 1; // approximate knowing impl
+        adapter._bulkDocs({ docs: [{ _id: 'doc1', val: 1 }] }, {}, () => {
 
-            // 2. Put doc2
-            adapter._bulkDocs({ docs: [{ _id: 'doc2', val: 2 }] }, {}, (err: any, res: any) => {
+            // 2. Checkpoint where a replication target would: on the last_seq it was
+            // given, not on a guess about what the numbers look like.
+            adapter._changes({
+                since: 0,
+                complete: (err: any, first: any) => {
+                    expect(first.results.map((r: any) => r.id)).toEqual(['doc1']);
+                    const checkpoint = first.last_seq;
 
-                // 3. Get changes since seq1 (Should only see doc2)
-                adapter._changes({
-                    since: seq1,
-                    include_docs: true,
-                    complete: (err: any, res: any) => {
-                        expect(res.results.length).toBe(1);
-                        expect(res.results[0].id).toBe('doc2');
-                        done();
-                    }
-                });
+                    // 3. Put doc2
+                    adapter._bulkDocs({ docs: [{ _id: 'doc2', val: 2 }] }, {}, () => {
+
+                        // 4. Changes since the checkpoint: doc2 only.
+                        adapter._changes({
+                            since: checkpoint,
+                            include_docs: true,
+                            complete: (err: any, res: any) => {
+                                expect(res.results.length).toBe(1);
+                                expect(res.results[0].id).toBe('doc2');
+                                done();
+                            }
+                        });
+                    });
+                }
             });
         });
     });

@@ -17,6 +17,45 @@ const DEFAULT_CACHE_SIZE = 1000; // Number of docs
 const META_COMMIT_RETRIES = 6; // read-modify-write attempts per _meta.json commit
 const RETIRED_LOG_HISTORY = 500; // tombstones kept for change logs compaction deleted
 
+/**
+ * Sequence numbers are `tick * SEQ_SLOTS + writerSlot`.
+ *
+ * Writers mint them blind to one another - there is no lock and no compare-and-swap -
+ * so two clients reading the same counter will always be able to derive the same next
+ * tick. Reserving the low digits for a per-writer slot means they can share a tick and
+ * still never share a *sequence number*, which is the part that matters: `_changes`
+ * filters on `seq > since`, so a second document sharing a checkpointed sequence
+ * number is never emitted to a replication target again.
+ *
+ * A million slots keeps the chance that two concurrent writers hash to the same one
+ * near 1 in 20,000 for a ten-client fleet, and leaves room for 9e9 ticks inside
+ * Number.MAX_SAFE_INTEGER.
+ */
+export const SEQ_SLOTS = 1000000;
+
+/** Stable slot for a writer id. FNV-1a, folded into the slot space. */
+export function writerSlotFor(writerId: string): number {
+    let h = 2166136261;
+    for (let i = 0; i < writerId.length; i++) {
+        h ^= writerId.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return Math.abs(h) % SEQ_SLOTS;
+}
+
+function newWriterId(): string {
+    return Math.random().toString(36).substring(2, 10);
+}
+
+/** The writer id embedded in a change-log filename, if the name carries one.
+ *  New format: changes-<seq>-<writerId>-<random>.ndjson (4 dash-parts).
+ *  Old format: changes-<seq>-<random>.ndjson (3 parts) - no id to extract. */
+export function writerIdFromLogName(name: string): string | null {
+    if (!name.startsWith('changes-') || !name.endsWith('.ndjson')) return null;
+    const parts = name.slice(0, -'.ndjson'.length).split('-');
+    return parts.length === 4 ? parts[2] : null;
+}
+
 /** A trivial single-node pouchdb-merge tree for a bare rev string - used where a
  *  doc enters the index without going through _bulkDocs's real merge (local docs,
  *  legacy-snapshot migration, and the low-level DriveHandler.appendChange() API's
@@ -65,8 +104,10 @@ export class DriveHandler {
 
     /** Identifies this handler among the writers sharing a folder. Change-log
      *  filenames carry it, so two writers can never produce the same name and an
-     *  orphaned log can be traced back to whoever wrote it. */
-    private readonly writerId: string = Math.random().toString(36).substring(2, 10);
+     *  orphaned log can be traced back to whoever wrote it. Not readonly: if the
+     *  folder shows another writer whose id hashes to our sequence slot, we re-roll
+     *  to a free one before minting anything (see rerollIfSlotContested). */
+    private writerId: string = newWriterId();
 
     /** Change-log file ids this handler wrote, minus any a compaction has retired.
      *  Drive API v3 has no compare-and-swap (ETags were dropped), so another
@@ -74,6 +115,11 @@ export class DriveHandler {
      *  between. Anything still in here but missing from the remote changeLogIds was
      *  dropped that way and gets put back - see reconcileOwnLogs(). */
     private ownLogIds: Set<string> = new Set();
+
+    /** This writer's reservation in the low digits of every sequence number it mints.
+     *  Derived from writerId; changes only when writerId is re-rolled off a
+     *  contested slot. */
+    private writerSlot: number = writerSlotFor(this.writerId);
 
     /** Serializes this handler's own _meta.json read-modify-write cycles. Says
      *  nothing about other clients - that is what commitMeta's verify pass is for -
@@ -219,7 +265,34 @@ export class DriveHandler {
 
                 // 2. Replay NEW Change Logs (Metadata only updates)
                 this.log('Replaying change logs');
-                const pendingLogs = this.meta.changeLogIds.filter(id => !this.processedLogIds.has(id));
+                const retired = new Set(this.meta.retiredLogIds || []);
+
+                // Take the union of what the metadata references and what is actually
+                // in the folder. A log missing from changeLogIds but present in the
+                // folder was orphaned by a lost metadata update; a log referenced but
+                // absent was deleted after being referenced. Both are survivable if
+                // the folder gets the last word.
+                let discovered: string[] = [];
+                try {
+                    const listed = await this.listChangeLogs();
+
+                    // The same listing shows every writer's id - the moment to notice
+                    // someone else is on our sequence slot and move off it.
+                    this.rerollIfSlotContested(listed.map(f => f.name));
+
+                    const referenced = new Set(this.meta.changeLogIds);
+                    discovered = listed.map(f => f.id).filter(id => !referenced.has(id) && !retired.has(id));
+                    if (discovered.length > 0) {
+                        this.log('Found change logs the metadata does not reference', discovered);
+                    }
+                } catch (e) {
+                    // Listing is an optimisation over the metadata, never a
+                    // prerequisite - a failure here must not fail the load.
+                    this.log('Failed to list change logs, falling back to metadata only', e);
+                }
+
+                const pendingLogs = [...this.meta.changeLogIds, ...discovered]
+                    .filter(id => !this.processedLogIds.has(id) && !retired.has(id));
 
                 if (pendingLogs.length > 0) {
                     this.log(`Downloading ${pendingLogs.length} change logs in parallel`);
@@ -232,6 +305,19 @@ export class DriveHandler {
                             return { id, changes: null };
                         }
                     }));
+
+                    // Replay in sequence order, not in the order the ids happened to
+                    // be listed. Two clients can hold different changeLogIds orderings
+                    // for the same folder once merges are in play, and updateIndex
+                    // takes the last write for a document - so insertion order meant
+                    // two readers of one folder could disagree about the winner.
+                    logResults.sort((a, b) => {
+                        const seqOf = (r: { changes: ChangeEntry[] | null }) =>
+                            r.changes && r.changes.length ? (Array.isArray(r.changes) ? r.changes[0].seq : (r.changes as any).seq) : Number.MAX_SAFE_INTEGER;
+                        const sa = seqOf(a), sb = seqOf(b);
+                        if (sa !== sb) return sa - sb;
+                        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+                    });
 
                     const foundNew: Record<string, any> = {};
                     for (const { id, changes } of logResults) {
@@ -267,6 +353,19 @@ export class DriveHandler {
                 // 2. Replay NEW Change Logs (Metadata only updates)
                 // ... (previous logic for change logs)
                 // (Already updated in previous turn, keep it)
+
+                    // Put what we found back into the metadata, so the next reader
+                    // does not have to rediscover it and compaction can see it. Any
+                    // client repairs this, not only the writer that lost the race.
+                    if (discovered.length > 0) {
+                        await this.commitMeta((latest) => {
+                            const referenced = new Set(latest.changeLogIds);
+                            const stillRetired = new Set(latest.retiredLogIds || []);
+                            const missing = discovered.filter(id => !referenced.has(id) && !stillRetired.has(id));
+                            if (missing.length === 0) return null;
+                            return { ...latest, changeLogIds: [...latest.changeLogIds, ...missing] };
+                        });
+                    }
 
                 // 2b. Load Local Documents Store (Pinned in meta)
                 if (this.meta.localDocsId) {
@@ -701,9 +800,16 @@ export class DriveHandler {
                 continue;
             }
 
+            // Take the tick from whatever counter is furthest along and stamp our own
+            // slot into it. Another writer working from the same counter lands on the
+            // same tick and a different sequence number, which is the point - there is
+            // no way to stop them sharing the tick, and no longer any need to.
             const observedSeq = current ? current.meta.seq : this.meta.seq;
-            const base = Math.max(observedSeq, this.meta.seq);
-            changes.forEach((change, i) => { change.seq = base + i + 1; });
+            const baseTick = Math.floor(Math.max(observedSeq, this.meta.seq) / SEQ_SLOTS);
+            changes.forEach((change, i) => {
+                change.seq = (baseTick + i + 1) * SEQ_SLOTS + this.writerSlot;
+            });
+            const lastSeq = changes[changes.length - 1].seq;
 
             // 2. Write Log File (Upload Data). `nextIndexEntry` (the merged tree, only
             // needed transiently by updateIndex() below) is stripped first - it's
@@ -720,17 +826,17 @@ export class DriveHandler {
             let committed: MetaData | null;
             try {
                 committed = await this.commitMeta(
-                    (latest) => {
-                        if (latest.seq !== observedSeq) return null;
-                        return {
-                            ...latest,
-                            // Idempotent: commitMeta may run this more than once.
-                            changeLogIds: latest.changeLogIds.includes(fileId)
-                                ? latest.changeLogIds
-                                : [...latest.changeLogIds, fileId],
-                            seq: base + changes.length
-                        };
-                    },
+                    (latest) => ({
+                        ...latest,
+                        // Idempotent: commitMeta may run this more than once.
+                        changeLogIds: latest.changeLogIds.includes(fileId)
+                            ? latest.changeLogIds
+                            : [...latest.changeLogIds, fileId],
+                        // Never let the shared counter go backwards: another writer may
+                        // have reached a higher tick while we were uploading, and
+                        // rewinding it would hand our tick out a second time.
+                        seq: Math.max(latest.seq, lastSeq)
+                    }),
                     { verify: (m) => m.changeLogIds.includes(fileId) }
                 );
             } catch (err) {
@@ -739,9 +845,10 @@ export class DriveHandler {
             }
 
             if (!committed) {
-                // Nothing references the log we just uploaded and its sequence
-                // numbers are stale, so it is not salvageable - drop it and redo the
-                // whole thing against fresh metadata.
+                // commitMeta ran out of attempts. Nothing references the log we just
+                // uploaded, so drop it and start over against fresh metadata. This no
+                // longer fires for a sequence collision - slots make those impossible -
+                // only for a metadata write that would not stick.
                 this.log('Change log not published, retrying', { fileId, attempt });
                 this.discardLog(fileId);
                 await this.backoff(attempt++);
@@ -1220,6 +1327,60 @@ export class DriveHandler {
         return createRes.id;
     }
 
+    /** Every change log in the folder, whatever _meta.json has to say about them.
+     *
+     *  The folder is the authority on which change logs exist; _meta.json is only a
+     *  cache of that, and a lossy one - it is a whole-file read-modify-write with no
+     *  compare-and-swap behind it, so a writer whose metadata lands and is then
+     *  overwritten by a slower writer loses its reference. The file is still right
+     *  here. Listing for it is what stops a lost update from becoming a lost
+     *  document. */
+    private async listChangeLogs(): Promise<Array<{ id: string; name: string }>> {
+        const q = `name contains 'changes-' and '${this.folderId}' in parents and trashed = false`;
+        const files = await this.client.listFiles(q);
+        return files.filter(f => f.name.startsWith('changes-')).map(f => ({ id: f.id, name: f.name }));
+    }
+
+    /**
+     * Give up a sequence slot another writer is already using.
+     *
+     * Slots make sequence collisions structurally impossible only between writers on
+     * *different* slots; two ids hashing to the same slot are back to the dense
+     * allocation this scheme replaced. The filenames the folder listing hands us
+     * carry every writer's id, so a contested slot is visible - and since this
+     * handler re-rolls before minting anything against what it just saw, the
+     * exposure shrinks from "the whole session" to "rival's first log not yet
+     * visible in a listing".
+     *
+     * Logs already written keep their old name and numbers; ownLogIds tracks file
+     * ids, not names, so nothing else cares.
+     */
+    private rerollIfSlotContested(logNames: string[]): void {
+        const rivalSlots = new Set<number>();
+        for (const name of logNames) {
+            const id = writerIdFromLogName(name);
+            if (id && id !== this.writerId) rivalSlots.add(writerSlotFor(id));
+        }
+        if (!rivalSlots.has(this.writerSlot)) return;
+
+        for (let attempt = 0; attempt < 50; attempt++) {
+            const candidateId = newWriterId();
+            const candidateSlot = writerSlotFor(candidateId);
+            if (!rivalSlots.has(candidateSlot)) {
+                this.log('Sequence slot contested, re-rolling writer id', {
+                    from: { writerId: this.writerId, slot: this.writerSlot },
+                    to: { writerId: candidateId, slot: candidateSlot }
+                });
+                this.writerId = candidateId;
+                this.writerSlot = candidateSlot;
+                return;
+            }
+        }
+        // ~50 rivals colliding with 50 fresh rolls in a million-slot space does not
+        // happen by chance; leave the slot alone rather than loop forever.
+        this.log('Could not find a free sequence slot, keeping', this.writerSlot);
+    }
+
     /** Every file in the folder with this name. Drive allows duplicates, so this is
      *  how the callers that care (see ensureMetaFile) find out there are any. */
     private async findFiles(name: string): Promise<FilePointer[]> {
@@ -1314,10 +1475,11 @@ export class DriveHandler {
     }
 
     private async countTotalChanges(): Promise<number> {
-        // If no snapshot exists yet, total changes = meta.seq (all changes)
-        if (!this.meta.snapshotIndexId) {
-            return this.meta.seq;
-        }
+        // Count change-log files, not changes. This used to return meta.seq when there
+        // was no snapshot yet, on the reasoning that the counter and the change count
+        // were the same number. Sequence numbers now carry a writer slot in their low
+        // digits (see SEQ_SLOTS), so meta.seq is about a million times the tick and
+        // would trigger a compaction on the very first write.
 
         // Each log file ID in changeLogIds represents some number of changes.
         // For simplicity and to trigger compaction based on file count (which is what matters for Drive),
