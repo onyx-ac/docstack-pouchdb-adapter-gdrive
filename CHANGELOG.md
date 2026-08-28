@@ -1,6 +1,30 @@
 # Changelog
 
-## 0.1.7 — unreleased
+## 0.1.8 — unreleased
+
+### Fixed
+
+- **A connectivity blip on the read that verifies a metadata commit no longer
+  deletes the committed change log.** The commit had landed; the failed read made
+  the writer treat it as unpublished and clean up a log the metadata referenced — a
+  dangling reference, and the document behind it gone despite a successful write. A
+  landed write is now reported as committed even when its verification read fails.
+  A hard kill at the same point survived only by accident: severed connectivity made
+  the cleanup delete fail too. A blip restores connectivity in time for the delete
+  to succeed, which is what made this the worse case.
+
+### Added
+
+- `tests/interruption_recovery.test.ts` — six scenarios for a tab killed mid-write
+  (after the log upload; after the metadata commit), a connectivity blip on exactly
+  the verification read, a connectivity pause and recovery, a frozen client
+  resuming against a folder that moved on, and polling through an outage. The
+  invariant throughout: an acknowledged write survives any interruption that
+  follows; a rejected one may vanish or become visible later, but never takes an
+  acknowledged write with it.
+
+
+## 0.1.7 — 2026-08-27
 
 ### Fixed
 

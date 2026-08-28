@@ -43,6 +43,9 @@ export class FakeDrive {
         this.jitter = false;
         this.severed = false;
         this.swallowWritesTo = null;
+        this.killAfterCreateMatching = null;
+        this.killAfterUpdateOf = null;
+        this.blipReadAfterUpdateOf = null;
         this.failNextDownloadOf = new Set();
         this.maxConcurrentDownloads = 0;
         this.inFlightDownloads = 0;
@@ -67,8 +70,25 @@ export class FakeDrive {
      *  that goes away mid-write. */
     private severed = false;
 
+    /** When set, the connection is severed the moment a createFile whose name
+     *  contains this string completes - a tab killed right after an upload, before
+     *  whatever was supposed to come next. */
+    killAfterCreateMatching: string | null = null;
+
+    /** When set, severed the moment an updateFile of this file id completes - a tab
+     *  killed right after a metadata commit, before the read that verifies it. */
+    killAfterUpdateOf: string | null = null;
+
+    /** When set, an updateFile of this file id arms a fail-once on downloading the
+     *  same file - a connectivity blip that hits exactly the read verifying a
+     *  metadata commit, and nothing before it. */
+    blipReadAfterUpdateOf: string | null = null;
+
     /** Stop answering, the way a closed tab stops answering. */
     sever() { this.severed = true; }
+
+    /** Connectivity comes back. */
+    restore() { this.severed = false; this.killAfterCreateMatching = null; this.killAfterUpdateOf = null; }
 
     private tick() {
         if (this.severed) {
@@ -227,6 +247,9 @@ export class FakeDrive {
                     modifiedTime: new Date().toISOString()
                 };
                 drive.files.set(id, file);
+                if (drive.killAfterCreateMatching && name.includes(drive.killAfterCreateMatching)) {
+                    drive.severed = true; // the upload landed; the writer is gone
+                }
                 return { id, etag: '', modifiedTime: file.modifiedTime, md5Checksum: drive.md5(file) };
             }),
             updateFile: jest.fn(async (fileId: string, content: string, _expectedEtag?: string) => {
@@ -238,6 +261,13 @@ export class FakeDrive {
                 if (drive.swallowWritesTo !== fileId) {
                     file.content = content;
                     file.modifiedTime = new Date().toISOString();
+                }
+                if (drive.killAfterUpdateOf === fileId) {
+                    drive.severed = true; // the write landed; the writer is gone
+                }
+                if (drive.blipReadAfterUpdateOf === fileId) {
+                    drive.failNextDownloadOf.add(fileId);
+                    drive.blipReadAfterUpdateOf = null;
                 }
                 return { id: fileId, etag: '', modifiedTime: file.modifiedTime, md5Checksum: drive.md5(file) };
             }),

@@ -1360,7 +1360,20 @@ export class DriveHandler {
                     return next;
                 }
 
-                const after = await this.readMetaBody(current.pointer.fileId);
+                // From here on the write HAS landed. Whatever the verify read does,
+                // this attempt must never surface as "not committed" - a caller told
+                // that would clean up a change log the metadata now references,
+                // leaving a dangling reference and losing the document behind it. A
+                // read failure is a read failure, not a failed commit: report the
+                // commit as landed, unverified.
+                let after: MetaData | null;
+                try {
+                    after = await this.readMetaBody(current.pointer.fileId);
+                } catch (e) {
+                    this.log('Verify read failed after a landed write, reporting the commit as-is', e);
+                    this.meta = next;
+                    return next;
+                }
                 if (after && opts.verify(after)) {
                     // Adopt the remote view rather than our own - it carries whatever
                     // else landed alongside us.
