@@ -1,6 +1,7 @@
 # ADR-0001 — `_meta.json` writes without compare-and-swap
 
-Status: accepted · Date: 2026-08-26 · Package: `@docstack/pouchdb-adapter-googledrive`
+Status: superseded in part by [ADR-0002](0002-the-folder-is-the-index.md) · Date:
+2026-08-26 · Package: `@docstack/pouchdb-adapter-googledrive`
 
 Follows [docstack-gdrive-adapter-0.1.5.md](docstack-gdrive-adapter-0.1.5.md), finding #1.
 
@@ -151,9 +152,13 @@ cheapest remaining win here; it is left for a separate change because it touches
 
 **What is still not guaranteed:**
 
-- A client that writes and then disconnects *forever* inside the one-round-trip window
-  can still leave a log unreferenced. Mechanisms 3 and 4 both need the writer to live
-  long enough to run them.
+- ~~A client that writes and then disconnects *forever* inside the one-round-trip
+  window can still leave a log unreferenced. Mechanisms 3 and 4 both need the writer
+  to live long enough to run them.~~ **This was understated, and it lost documents in
+  production — see [ADR-0002](0002-the-folder-is-the-index.md).** The window is not
+  one round trip but *until this client writes again*, which for the last write of a
+  session is never. Change logs are now found by listing the folder, so a lost
+  reference no longer costs a document.
 - Concurrent writes to the *same document* resolve last-writer-wins in the index
   rather than through pouchdb-merge: `_bulkDocs` computes its merged tree before the
   catch-up replay, so it is applied against a view that has since moved. Both

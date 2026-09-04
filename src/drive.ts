@@ -120,6 +120,14 @@ export class DriveHandler {
      *  dropped that way and gets put back - see reconcileOwnLogs(). */
     private ownLogIds: Set<string> = new Set();
 
+    /** Change logs proven gone: the metadata references them and Drive answers 404.
+     *  A dangling reference is damage some earlier defect already did (the 0.1.8
+     *  verify-blip bug deleted committed logs); what it must not do is compound -
+     *  a log that can only 404 for ever kept hasUnprocessedLogs() true for ever,
+     *  and every write spent its whole catch-up budget re-reading it and threw.
+     *  One lost change became a permanent, silent write outage. See finding 0007. */
+    private deadLogIds: Set<string> = new Set();
+
     /** This writer's reservation in the low digits of every sequence number it mints.
      *  Derived from writerId; changes only when writerId is re-rolled off a
      *  contested slot. */
@@ -153,6 +161,17 @@ export class DriveHandler {
 
     private log(...args: any[]) {
         console.log(`[googledrive-drive] [${this.meta.dbName}]`, ...args);
+    }
+
+    /** Feed the consumer's progress callback, if any. Its failures are its own. */
+    private reportProgress(phase: 'replay', done: number, total: number) {
+        const cb = this.options.onSyncProgress;
+        if (!cb) return;
+        try {
+            cb({ phase, done, total });
+        } catch (e) {
+            this.log('onSyncProgress callback threw', e);
+        }
     }
 
 
@@ -229,7 +248,8 @@ export class DriveHandler {
                 // compaction retiring it was dropped by another writer's
                 // read-modify-write. Put it back before replaying, so this load sees
                 // its own writes - and so the next reader does too.
-                if (this.hasOrphanedOwnLogs(this.meta)) {
+                if (this.hasOrphanedOwnLogs(this.meta) ||
+                    this.meta.changeLogIds.some(id => this.deadLogIds.has(id))) {
                     await this.commitMeta((latest, repaired) => repaired ? latest : null);
                 }
 
@@ -299,6 +319,7 @@ export class DriveHandler {
                     .filter(id => !this.processedLogIds.has(id) && !retired.has(id));
 
                 if (pendingLogs.length > 0) {
+                    this.reportProgress('replay', 0, pendingLogs.length);
                     this.log(`Downloading ${pendingLogs.length} change logs, ${LOG_DOWNLOAD_CONCURRENCY} at a time`);
                     // Bounded, not unbounded: a cold boot can hold dozens of pending
                     // logs, and firing them all at once is exactly the burst Drive's
@@ -310,8 +331,23 @@ export class DriveHandler {
                         try {
                             const changes = await this.downloadNdjson(id);
                             return { id, changes };
-                        } catch (e) {
-                            this.log(`Failed to download change log ${id}`, e);
+                        } catch (e: any) {
+                            // A 404 is an answer, not an outage: the file is gone and
+                            // no retry will bring it back. Recording it as processed
+                            // costs the changes it held - already lost - and keeps
+                            // that loss from also stopping every future write. Any
+                            // other failure stays retryable, as it should: retrying
+                            // is right when the file is there and the network was not.
+                            if (e?.status === 404) {
+                                this.log(`Change log ${id} is gone for good, writing it off`, e?.message);
+                                this.deadLogIds.add(id);
+                                this.processedLogIds.add(id);
+                                // Not ours to defend any more either - reconcile
+                                // would resurrect the reference for ever.
+                                this.ownLogIds.delete(id);
+                            } else {
+                                this.log(`Failed to download change log ${id}`, e);
+                            }
                             return { id, changes: null };
                         }
                     });
@@ -330,9 +366,15 @@ export class DriveHandler {
                     });
 
                     const foundNew: Record<string, any> = {};
+                    let replayed = 0;
                     for (const { id, changes } of logResults) {
+                        // A failed download still counts toward the cycle - the bar
+                        // must reach total even when a straggler is left for the next
+                        // load, or it sits at 71/72 looking stuck.
+                        replayed++;
                         if (!changes) {
                             this.log(`Skipping failed log ${id}`);
+                            this.reportProgress('replay', replayed, logResults.length);
                             continue;
                         }
 
@@ -352,6 +394,7 @@ export class DriveHandler {
                             };
                         }
                         this.processedLogIds.add(id);
+                        this.reportProgress('replay', replayed, logResults.length);
                     }
 
                     if (Object.keys(foundNew).length > 0) {
@@ -376,6 +419,15 @@ export class DriveHandler {
                             return { ...latest, changeLogIds: [...latest.changeLogIds, ...missing] };
                         });
                     }
+
+                // A reference proven dead during THIS replay (the 404s land in the
+                // download loop above, after the pre-replay repair has run) is
+                // pruned now, so a damaged folder heals on the first load that
+                // notices - by any client, reader or writer - rather than carrying
+                // a permanent 404 and a permanent log line until someone writes.
+                if (this.meta.changeLogIds.some(id => this.deadLogIds.has(id))) {
+                    await this.commitMeta((latest, repaired) => repaired ? latest : null);
+                }
 
                 // 2b. Load Local Documents Store (Pinned in meta)
                 if (this.meta.localDocsId) {
@@ -799,7 +851,15 @@ export class DriveHandler {
             // itself never does.)
             if (current && this.hasUnprocessedLogs(current.meta)) {
                 if (++catchUps > META_COMMIT_RETRIES) {
-                    throw new Error('Could not catch up with concurrent writers');
+                    // Naming what actually blocked us. The old message blamed
+                    // concurrent writers unconditionally, and sent a real
+                    // investigation looking for a second writer when the cause was
+                    // a change log that could not be read.
+                    const unreadable = current.meta.changeLogIds
+                        .filter(id => !this.processedLogIds.has(id));
+                    throw new Error(unreadable.length > 0
+                        ? `Could not catch up: change log(s) ${unreadable.join(', ')} could not be read after ${META_COMMIT_RETRIES} attempts`
+                        : 'Could not catch up with concurrent writers');
                 }
                 await this.load();
                 // Only the low-level appendChange() callers are checked here.
@@ -1323,6 +1383,25 @@ export class DriveHandler {
         return { ...latest, changeLogIds: [...latest.changeLogIds, ...missing] };
     }
 
+    /** Drop references this client has proven dead from `changeLogIds`, moving them
+     *  into `retiredLogIds` - the tombstone that stops the log's own writer from
+     *  restoring them (its reconcile respects retirement) and any client from
+     *  re-adopting them. Without the tombstone, prune-and-restore would ping-pong
+     *  between the pruning reader and the writer that still remembers the log.
+     *  Returns `latest` by identity when there is nothing to prune. */
+    private pruneDeadLogs(latest: MetaData): MetaData {
+        if (this.deadLogIds.size === 0) return latest;
+        const dead = latest.changeLogIds.filter(id => this.deadLogIds.has(id));
+        if (dead.length === 0) return latest;
+        this.log('Pruning dead change-log references', dead);
+        const retired = [...new Set([...(latest.retiredLogIds || []), ...dead])];
+        return {
+            ...latest,
+            changeLogIds: latest.changeLogIds.filter(id => !this.deadLogIds.has(id)),
+            retiredLogIds: retired.slice(-RETIRED_LOG_HISTORY)
+        };
+    }
+
     /**
      * Read-modify-write `_meta.json`.
      *
@@ -1341,7 +1420,7 @@ export class DriveHandler {
                 const current = await this.readRemoteMeta();
                 if (!current) throw new Error('Meta missing');
 
-                const reconciled = this.reconcileOwnLogs(current.meta);
+                const reconciled = this.pruneDeadLogs(this.reconcileOwnLogs(current.meta));
                 const next = modify(reconciled, reconciled !== current.meta);
                 if (!next) return null;
 

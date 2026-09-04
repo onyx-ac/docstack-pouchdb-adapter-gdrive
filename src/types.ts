@@ -21,6 +21,15 @@ export interface GoogleDriveAdapterOptions extends DriveClientOptions {
     cacheSize?: number;
     /** Enable debug logging */
     debug?: boolean;
+    /**
+     * Called as load() replays change logs, the phase where a cold connect to a
+     * busy folder can otherwise look frozen (a real-world boot has been seen with
+     * 72 logs pending). `done` counts logs applied so far out of `total` for THIS
+     * load; a later load that finds new logs starts a fresh cycle at 0. Errors
+     * thrown by the callback are swallowed - progress reporting must never be able
+     * to fail a load.
+     */
+    onSyncProgress?: (progress: { phase: 'replay'; done: number; total: number }) => void;
     /** Enable test mode (emulates Google Drive API) */
     testMode?: boolean;
     /** Test server URL (defaults to http://localhost:3000) */

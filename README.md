@@ -80,6 +80,44 @@ A tick costs one `files.list`, whatever has changed; only a tick that sees a new
 `md5Checksum` (or, failing that, a new `modifiedTime`) goes on to fetch anything.
 `db.close()` and `db.destroy()` stop it.
 
+### Sync progress
+
+Two signals, one per phase where a UI would otherwise show nothing:
+
+**Replication progress** rides PouchDB's standard pipeline. The adapter's changes
+feed reports `pending` (the CouchDB field), so replication `change` events and
+`activeTasks` carry it without any adapter-specific wiring:
+
+```typescript
+const rep = PouchDB.replicate(remote, local);
+rep.on('change', info => {
+  const done = info.docs_written;
+  const pct = Math.round(done / (done + info.pending) * 100);
+  // Freeze the denominator at cycle start, or clamp the bar monotone —
+  // other devices keep writing, so `pending` can grow mid-cycle.
+});
+```
+
+Do not derive progress from `update_seq` arithmetic: sequence numbers are sparse
+(they carry a writer slot in the low digits), so ratios of them mean nothing.
+
+**Connect progress** covers the cold load, where a busy folder replays dozens of
+change logs before the database is usable:
+
+```typescript
+GoogleDriveAdapter({
+  accessToken: '...',
+  folderId: 'my-folder-id',
+  onSyncProgress: ({ phase, done, total }) => {
+    // phase 'replay': applying change logs, done of total for this load.
+  }
+});
+```
+
+The callback is fire-and-forget: it always reaches `total` even when a log download
+fails (that log is retried on a later load), and an exception it throws cannot fail
+the load.
+
 ## Concurrent writers
 
 Several clients may share one folder. What that costs, and what it does not:

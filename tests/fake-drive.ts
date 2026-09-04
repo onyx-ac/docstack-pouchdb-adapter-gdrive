@@ -32,6 +32,9 @@ export class FakeDrive {
     /** File ids whose next content download fails once - the shape of a change-log
      *  GET clipped by Drive's rate limiter during a bursty load(). */
     failNextDownloadOf: Set<string> = new Set();
+    /** File ids whose content download ALWAYS fails (503) - a persistent outage that
+     *  is not a 404, so it must stay retryable and must never be written off. */
+    permanentlyFailDownloadOf: Set<string> = new Set();
     /** Peak number of content downloads in flight at once - what a rate limiter sees. */
     maxConcurrentDownloads = 0;
     private inFlightDownloads = 0;
@@ -47,6 +50,7 @@ export class FakeDrive {
         this.killAfterUpdateOf = null;
         this.blipReadAfterUpdateOf = null;
         this.failNextDownloadOf = new Set();
+        this.permanentlyFailDownloadOf = new Set();
         this.maxConcurrentDownloads = 0;
         this.inFlightDownloads = 0;
         this.counter = 0;
@@ -221,6 +225,9 @@ export class FakeDrive {
                 drive.maxConcurrentDownloads = Math.max(drive.maxConcurrentDownloads, drive.inFlightDownloads);
                 try {
                     await drive.tick();
+                    if (drive.permanentlyFailDownloadOf.has(fileId)) {
+                        throw Object.assign(new Error('Backend error'), { status: 503 });
+                    }
                     if (drive.failNextDownloadOf.delete(fileId)) {
                         throw Object.assign(new Error('Rate limit exceeded'), { status: 429 });
                     }

@@ -635,7 +635,8 @@ export function GoogleDriveAdapter(PouchDB: any) {
                     if (batch.length === 0) return;
 
                     const emit = (bodies: Record<string, any> | null) => {
-                        for (const { id, entry } of batch) {
+                        for (let i = 0; i < batch.length; i++) {
+                            const { id, entry } = batch[i];
                             const change: any = {
                                 id,
                                 seq: entry.seq,
@@ -644,8 +645,10 @@ export function GoogleDriveAdapter(PouchDB: any) {
                             // Same tombstone rule as the initial pass: a `null` body
                             // makes a filtered replication drop the deletion.
                             if (bodies) change.doc = bodies[id];
-                            if (opts.onChange) opts.onChange(change);
                             lastSeq = Math.max(lastSeq, entry.seq);
+                            // Same progress contract as the initial pass; for a live
+                            // batch the horizon is the batch itself.
+                            if (opts.onChange) opts.onChange(change, batch.length - (i + 1), lastSeq);
                         }
                     };
 
@@ -740,8 +743,9 @@ export function GoogleDriveAdapter(PouchDB: any) {
                     ? await loadChangeBodies(batch)
                     : null;
 
-                for (const { id, entry } of batch) {
+                for (let i = 0; i < batch.length; i++) {
                     if (complete) break;
+                    const { id, entry } = batch[i];
 
                     const change: any = {
                         id: id,
@@ -751,17 +755,32 @@ export function GoogleDriveAdapter(PouchDB: any) {
 
                     if (bodies) change.doc = bodies[id];
 
-                    if (opts.onChange) opts.onChange(change);
-                    if (returnDocs) results.push(change);
-
                     lastSeq = Math.max(lastSeq, entry.seq);
+
+                    // The second and third arguments are how progress actually
+                    // reaches a consumer: pouchdb-replication reads `pending` from
+                    // onChange's arguments (never from the complete response) and
+                    // surfaces it on its own 'change' events. `pending` here is
+                    // CouchDB's meaning - eligible changes remaining AFTER this row,
+                    // both the rest of this batch and everything beyond the limit.
+                    if (opts.onChange) opts.onChange(change, pending.length - (i + 1), lastSeq);
+                    if (returnDocs) results.push(change);
                 }
 
                 // ✅ Call opts.complete() ONLY for non-live modes
                 // PouchDB replication will infinite-loop reconnect if we call complete() on a live feed
                 if (opts.complete && !complete && !opts.live) {
-                    log('_changes calling complete callback with', { results_count: results.length, last_seq: lastSeq });
-                    opts.complete(null, { results, last_seq: lastSeq });
+                    // `pending` is what CouchDB reports and what PouchDB's whole
+                    // progress pipeline runs on: replication surfaces it on 'change'
+                    // events and in activeTasks' total_items. The number was already
+                    // computed to cut the batch; consumers turn it into a progress
+                    // bar as docs_written / (docs_written + pending). It is also the
+                    // only percentage source left standing - update_seq arithmetic
+                    // stopped meaning anything when sequence numbers went sparse
+                    // (ADR-0003).
+                    const remaining = Math.max(0, pending.length - batch.length);
+                    log('_changes calling complete callback with', { results_count: results.length, last_seq: lastSeq, pending: remaining });
+                    opts.complete(null, { results, last_seq: lastSeq, pending: remaining });
                 }
             }
 

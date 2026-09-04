@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.8 — unreleased
+## 0.1.8/9
 
 ### Fixed
 
@@ -13,7 +13,43 @@
   the cleanup delete fail too. A blip restores connectivity in time for the delete
   to succeed, which is what made this the worse case.
 
+- **One missing change log no longer stops every future write.** A reference to a
+  change log that answers 404 - damage the verify-blip bug above left in real
+  folders - kept the log permanently unprocessed, and every write burned its whole
+  catch-up budget re-reading it, then threw a message blaming concurrent writers.
+  A folder in that state accepted no writes from any device, indefinitely, while
+  reporting active and converging on schedule. A 404 is now an answer: the log is
+  written off, the reference pruned and tombstoned on the first load that proves it
+  dead, and the catch-up error names unreadable logs instead of guessing at
+  writers. Transient failures keep their retry. (ADR-0008 / finding 0007)
+
 ### Added
+
+- **Sync progress for consumers.** The changes feed now reports `pending` — the
+  CouchDB field PouchDB's progress pipeline already understands — so replication
+  `change` events and `activeTasks` can drive a progress bar as
+  `docs_written / (docs_written + pending)`. The count was already being computed
+  to cut each batch, then thrown away. It travels two ways, because PouchDB reads
+  them differently: per change through `onChange(change, pending, lastSeq)` — the
+  only form pouchdb-replication actually consumes for its events — and on the
+  complete response, CouchDB style. Verified end to end: a replication against a
+  memory target reports a decreasing `pending` on every change event. This is also
+  the only percentage source left:
+  `update_seq` ratios stopped meaning anything when sequence numbers went sparse.
+
+- **`onSyncProgress` adapter option** — reports change-log replay during `load()`
+  (`{ phase: 'replay', done, total }`), the cold-connect phase where a busy folder
+  (72 logs in one field report) previously looked frozen. Always reaches `total`
+  even when a straggler download fails; a throwing callback cannot fail the load.
+
+- `tests/dead_log.test.ts` — five cases around the write outage: writes continue
+  past a dangling reference, the folder heals on first load, the log's own writer
+  does not resurrect a pruned reference, transient failures keep their retry, and
+  the error names the unreadable log.
+
+- `tests/sync_progress.test.ts` — seven cases for the progress feedback, including
+  the end-to-end check that `pending` survives the trip through pouchdb-replication
+  onto its 'change' events.
 
 - `tests/interruption_recovery.test.ts` — six scenarios for a tab killed mid-write
   (after the log upload; after the metadata commit), a connectivity blip on exactly
